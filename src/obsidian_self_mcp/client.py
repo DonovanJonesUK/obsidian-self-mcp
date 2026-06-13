@@ -65,6 +65,13 @@ class ObsidianVaultClient:
         if resp.status_code == 200:
             return resp.json()
 
+        # Fallback: search by path field (for hash-ID format f:... used by newer LiveSync)
+        path_lower = path.lower()
+        all_docs = await self._get_all_file_docs()
+        for doc in all_docs:
+            if doc.get("path", "").lower() == path_lower:
+                return doc
+
         return None
 
     async def _fetch_chunks(self, chunk_ids: list[str]) -> dict[str, str]:
@@ -133,7 +140,7 @@ class ObsidianVaultClient:
             folder_lower = folder.strip("/").lower() + "/"
             all_docs = [
                 d for d in all_docs
-                if d.get("_id", "").lstrip("/").startswith(folder_lower)
+                if d.get("path", d.get("_id", "")).lower().startswith(folder_lower)
             ]
 
         # Sort by mtime descending
@@ -466,7 +473,7 @@ class ObsidianVaultClient:
             folder_lower = folder.strip("/").lower() + "/"
             all_docs = [
                 d for d in all_docs
-                if d.get("_id", "").lstrip("/").startswith(folder_lower)
+                if d.get("path", d.get("_id", "")).lower().startswith(folder_lower)
             ]
 
         tag_counts: dict[str, int] = defaultdict(int)
@@ -490,7 +497,7 @@ class ObsidianVaultClient:
             folder_lower = folder.strip("/").lower() + "/"
             all_docs = [
                 d for d in all_docs
-                if d.get("_id", "").lstrip("/").startswith(folder_lower)
+                if d.get("path", d.get("_id", "")).lower().startswith(folder_lower)
             ]
 
         results = []

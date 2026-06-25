@@ -26,6 +26,30 @@ BINARY_EXTENSIONS = {
 }
 
 
+def _replace_wikilink_target(content: str, old_name: str, new_name: str) -> str:
+    """Replace [[OldName...]] wikilinks with [[NewName...]], case-insensitive on filename.
+
+    Handles [[Name]], [[Name|alias]], [[Name#heading]], [[Name#heading|alias]],
+    and full-path variants [[Folder/Name]]. Preserves heading and alias text unchanged.
+    Known limitation: wikilinks inside fenced code blocks are also replaced.
+    """
+    import re
+    old_lower = old_name.lower()
+
+    def replacer(m: re.Match) -> str:
+        full = m.group(0)
+        target = m.group(1)     # path portion (no # or |)
+        rest = m.group(2) or ""  # heading + alias (e.g. "#Section|display")
+        filename = target.rsplit("/", 1)[-1]
+        if filename.lower() != old_lower:
+            return full
+        prefix = target[: len(target) - len(filename)]
+        return f"[[{prefix}{new_name}{rest}]]"
+
+    pattern = re.compile(r"\[\[([^\]|#]+)([^\]]*)\]\]")
+    return pattern.sub(replacer, content)
+
+
 class ObsidianVaultClient:
     """Async client for reading/writing Obsidian vault docs in CouchDB."""
 
@@ -364,6 +388,95 @@ class ObsidianVaultClient:
                 )
         resp.raise_for_status()
         return True
+
+    async def _delete_entry_doc(self, path: str) -> None:
+        """Delete only the top-level entry document for a note, leaving chunk docs intact.
+
+        Used by rename_note to avoid deleting chunks that may be shared across
+        LiveSync-authored notes with identical content (content-addressed chunk IDs).
+        Orphaned chunks are harmless — LiveSync GC handles them.
+        """
+        client = await self._get_client()
+        doc = await self._get_doc(path)
+        if not doc:
+            return
+        doc_encoded = encode_doc_id(doc["_id"])
+        resp = await client.delete(f"/{doc_encoded}", params={"rev": doc["_rev"]})
+        if resp.status_code == 409:
+            fresh = await self._get_doc(path)
+            if fresh:
+                fresh_id = encode_doc_id(fresh["_id"])
+                await client.delete(f"/{fresh_id}", params={"rev": fresh["_rev"]})
+
+    async def rename_note(self, old_path: str, new_path: str) -> str:
+        """Rename a note and update all wikilink backlinks at the CouchDB layer.
+
+        Calls get_backlinks before any mutation. For each source note that links to
+        old_path, replaces [[OldName...]] wikilinks with [[NewName...]]. Then writes
+        the new note and deletes the old one. Raises ValueError if old_path not found
+        or new_path already exists. Returns a summary string with backlink counts.
+        """
+        old_path = old_path.lstrip("/")
+        new_path = new_path.lstrip("/")
+
+        old_doc = await self._get_doc(old_path)
+        if not old_doc:
+            raise ValueError(f"Source note not found: {old_path}")
+
+        new_doc = await self._get_doc(new_path)
+        if new_doc:
+            raise ValueError(f"Destination already exists: {new_path}")
+
+        old_name = old_path.rsplit("/", 1)[-1]
+        if old_name.endswith(".md"):
+            old_name = old_name[:-3]
+        new_name = new_path.rsplit("/", 1)[-1]
+        if new_name.endswith(".md"):
+            new_name = new_name[:-3]
+
+        old_note = await self.read_note(old_path)
+        if not old_note:
+            raise ValueError(f"Could not read source note: {old_path}")
+
+        backlinks = await self.get_backlinks(old_path)
+
+        # Write new file first — if this fails, no state has been mutated.
+        # Also apply wikilink replacement to the content itself (handles self-links).
+        new_content_body = _replace_wikilink_target(old_note.content, old_name, new_name)
+        await self.write_note(new_path, new_content_body)
+
+        # Update backlink sources now that new_path exists.
+        updated = 0
+        warnings: list[str] = []
+        for bl in backlinks:
+            if bl.source_path == old_path:
+                # Self-link already handled by writing updated body above.
+                updated += 1
+                continue
+            try:
+                note = await self.read_note(bl.source_path)
+                if not note or note.is_binary:
+                    warnings.append(f"skipped {bl.source_path} (unreadable or binary)")
+                    continue
+                updated_content = _replace_wikilink_target(note.content, old_name, new_name)
+                if updated_content != note.content:
+                    await self.write_note(bl.source_path, updated_content)
+                    updated += 1
+            except Exception as exc:
+                warnings.append(f"failed {bl.source_path}: {exc}")
+
+        # Soft-delete the old entry doc only — do not delete chunks.
+        # LiveSync-authored notes may share content-addressed chunk IDs across files;
+        # deleting chunks risks breaking unrelated notes. Orphaned chunks are harmless.
+        await self._delete_entry_doc(old_path)
+
+        result = (
+            f"Renamed: {old_path} → {new_path} | "
+            f"backlinks found: {len(backlinks)}, updated: {updated}"
+        )
+        if warnings:
+            result += " | warnings: " + "; ".join(warnings)
+        return result
 
     # ── Search ─────────────────────────────────────────────────────
 

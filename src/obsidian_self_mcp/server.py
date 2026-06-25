@@ -182,6 +182,24 @@ async def search_by_tag(
 
 
 @mcp.tool()
+async def rename_note(old_path: str, new_path: str) -> str:
+    """Rename a note and propagate wikilink backlinks atomically.
+
+    Before any mutation, calls get_backlinks on old_path. For each note that
+    links to old_path via [[OldName...]] wikilinks, updates the link to
+    [[NewName...]] (preserving heading anchors and display aliases). Then writes
+    the new note and deletes the old. Raises if old_path not found or new_path
+    already exists.
+
+    Args:
+        old_path: Vault path of the note to rename (e.g. "Projects/Foo/Bar.md")
+        new_path: New vault path — must not already exist
+    """
+    client = _get_client()
+    return await client.rename_note(old_path, new_path)
+
+
+@mcp.tool()
 async def get_backlinks(path: str) -> str:
     """Find notes that link to this note via wikilinks.
 

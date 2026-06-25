@@ -127,6 +127,7 @@ Add to your Claude Code settings (`.claude/settings.json` or global):
 | `search_by_tag` | Find notes containing a specific tag |
 | `get_backlinks` | Find notes that link to a given note |
 | `get_outbound_links` | List wikilinks from a note |
+| `rename_note` | Rename a note and update all wikilink backlinks atomically |
 
 ## CLI Usage
 
@@ -172,6 +173,11 @@ obsidian tags --find "project"           # find notes with a tag
 obsidian backlinks "Notes/todo.md"       # notes linking to this note
 obsidian links "Notes/todo.md"           # outbound wikilinks from this note
 
+# Rename a note (updates all wikilink backlinks atomically)
+obsidian rename "Notes/old-name.md" "Notes/new-name.md"
+obsidian mv "Notes/old-name.md" "Notes/new-name.md"     # alias
+obsidian rename "Notes/old-name.md" "Notes/new-name.md" -y  # skip confirmation
+
 # List folders
 obsidian folders
 obsidian tree                            # alias
@@ -182,6 +188,8 @@ obsidian tree                            # alias
 LiveSync splits each note into a parent document (metadata + ordered list of chunk IDs) and one or more chunk documents (the actual content). This tool handles all of that transparently — reads reassemble chunks in order, writes create proper chunk documents, and deletes clean up both the parent and all chunks.
 
 Document IDs are lowercased vault paths. Paths starting with `_` (like `_Changelog/`) get a `/` prefix since CouchDB reserves `_`-prefixed IDs.
+
+**Rename safety:** LiveSync uses content-addressed chunk IDs, so two notes with identical content share the same chunk documents. A naive rename that deletes the old note with `delete_note` would also delete those shared chunks, silently corrupting any other note that references them. The `rename_note` tool avoids this by soft-deleting only the parent entry document — leaving the chunk documents intact for LiveSync's garbage collector — while atomically updating all wikilink backlinks in other notes before the old path disappears.
 
 ## License
 

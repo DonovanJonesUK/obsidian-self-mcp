@@ -151,6 +151,16 @@ async def _cmd_links(client: ObsidianVaultClient, args):
     print(f"\n{len(links)} links")
 
 
+async def _cmd_rename(client: ObsidianVaultClient, args):
+    if not args.y:
+        confirm = input(f"Rename '{args.old_path}' → '{args.new_path}'? [y/N] ")
+        if confirm.lower() != "y":
+            print("Cancelled.")
+            return
+    result = await client.rename_note(args.old_path, args.new_path)
+    print(result)
+
+
 async def _cmd_folders(client: ObsidianVaultClient, args):
     folders = await client.list_folders()
     if not folders:
@@ -219,6 +229,15 @@ def main():
     p_links = sub.add_parser("links", help="Show outbound wikilinks from a note")
     p_links.add_argument("path", help="Vault path to the note")
 
+    # rename / mv
+    p_rename = sub.add_parser(
+        "rename", aliases=["mv"],
+        help="Rename a note and propagate wikilink backlinks",
+    )
+    p_rename.add_argument("old_path", help="Current vault path")
+    p_rename.add_argument("new_path", help="New vault path (must not exist)")
+    p_rename.add_argument("-y", action="store_true", help="Skip confirmation")
+
     # folders / tree
     sub.add_parser("folders", aliases=["tree"], help="List folders")
 
@@ -235,6 +254,7 @@ def main():
         "tags": _cmd_tags,
         "backlinks": _cmd_backlinks,
         "links": _cmd_links,
+        "rename": _cmd_rename, "mv": _cmd_rename,
         "folders": _cmd_folders, "tree": _cmd_folders,
     }
 

@@ -62,7 +62,9 @@ def set_frontmatter(content: str, properties: dict) -> str:
     existing, body = extract_frontmatter(content)
     merged = existing or {}
     merged.update(properties)
-    fm_str = yaml.dump(merged, default_flow_style=False, allow_unicode=True).rstrip("\n")
+    # width=inf prevents PyYAML from wrapping long plain scalars (default width=80)
+    # which would produce multi-line YAML that naive line-parsers truncate.
+    fm_str = yaml.dump(merged, default_flow_style=False, allow_unicode=True, width=float("inf")).rstrip("\n")
     return f"---\n{fm_str}\n---\n{body}"
 
 

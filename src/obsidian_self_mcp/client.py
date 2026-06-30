@@ -1,6 +1,7 @@
 """Async CouchDB client for Obsidian vault operations."""
 
 import base64
+import logging
 import time
 import urllib.parse
 from collections import defaultdict
@@ -18,6 +19,8 @@ from .utils import (
     normalize_doc_id,
     set_frontmatter,
 )
+
+logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 10000  # ~10KB chunks for binary
 BINARY_EXTENSIONS = {
@@ -56,6 +59,7 @@ class ObsidianVaultClient:
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
         self._client: httpx.AsyncClient | None = None
+        self._last_ntfy_time: float = 0.0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -97,6 +101,55 @@ class ObsidianVaultClient:
                 return doc
 
         return None
+
+    async def _canonicalize_path(self, vault_path: str) -> str:
+        """Resolve canonical folder casing from existing vault docs.
+
+        Walks ancestor folders from deepest to shallowest, querying CouchDB
+        for any existing doc. When found, extracts canonical folder casing from
+        that doc's path field and reconstructs the full path. Filename component
+        is always taken from vault_path unchanged. Falls back to vault_path if
+        no ancestor folder has existing docs or if the lookup fails.
+        """
+        if "/" not in vault_path:
+            return vault_path
+
+        parts = vault_path.split("/")
+
+        for depth in range(len(parts) - 1, 0, -1):
+            parent_id = "/".join(p.lower() for p in parts[:depth])
+            try:
+                client = await self._get_client()
+                resp = await client.get(
+                    "/_all_docs",
+                    params={
+                        "startkey": '"' + parent_id + '/"',
+                        "endkey": '"' + parent_id + '/￰"',
+                        "limit": "1",
+                        "include_docs": "true",
+                    },
+                )
+                resp.raise_for_status()
+                rows = resp.json().get("rows", [])
+                if rows:
+                    existing_path = rows[0]["doc"].get("path", "")
+                    existing_parts = existing_path.split("/")
+                    if len(existing_parts) > depth:
+                        canonical_folder = "/".join(existing_parts[:depth])
+                        remaining = "/".join(parts[depth:])
+                        canonical = canonical_folder + "/" + remaining
+                        if canonical != vault_path:
+                            logger.warning(
+                                "Path canonicalized: %r -> %r", vault_path, canonical
+                            )
+                        return canonical
+            except Exception as e:
+                logger.error(
+                    "_canonicalize_path lookup failed for %r: %s", vault_path, e
+                )
+                return vault_path
+
+        return vault_path
 
     async def _fetch_chunks(self, chunk_ids: list[str]) -> dict[str, str]:
         """Batch-fetch chunks via POST _all_docs. Returns {chunk_id: data}."""
@@ -224,6 +277,25 @@ class ObsidianVaultClient:
         ]
         return results
 
+    async def _notify_livesync(self) -> None:
+        """POST to ntfy to wake mobile LiveSync clients. Rate-limited per batch_seconds."""
+        cfg = self.config
+        if not cfg.ntfy_url or not cfg.ntfy_topic:
+            return
+        now = time.time()
+        if now - self._last_ntfy_time < cfg.ntfy_batch_seconds:
+            return
+        self._last_ntfy_time = now
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as ntfy:
+                await ntfy.post(
+                    f"{cfg.ntfy_url}/{cfg.ntfy_topic}",
+                    content=b"livesync",
+                    headers={"Title": "Obsidian Sync", "Priority": "low", "Tags": "notebook"},
+                )
+        except Exception:
+            pass
+
     # ── Write operations ───────────────────────────────────────────
 
     async def write_note(
@@ -286,10 +358,11 @@ class ObsidianVaultClient:
                     resp = await client.put(f"/{fresh_id}", json=fresh)
             resp.raise_for_status()
         else:
+            canonical_path = await self._canonicalize_path(vault_path)
             new_doc = {
                 "_id": doc_id,
                 "children": chunk_ids,
-                "path": vault_path,
+                "path": canonical_path,
                 "ctime": now_ms,
                 "mtime": now_ms,
                 "size": file_size,
@@ -299,6 +372,7 @@ class ObsidianVaultClient:
             resp = await client.put(f"/{encoded_id}", json=new_doc)
             resp.raise_for_status()
 
+        await self._notify_livesync()
         return True
 
     async def append_note(self, path: str, content: str) -> bool:
@@ -353,6 +427,7 @@ class ObsidianVaultClient:
                 fresh_id = encode_doc_id(fresh["_id"])
                 resp = await client.put(f"/{fresh_id}", json=fresh)
         resp.raise_for_status()
+        await self._notify_livesync()
         return True
 
     async def delete_note(self, path: str) -> bool:

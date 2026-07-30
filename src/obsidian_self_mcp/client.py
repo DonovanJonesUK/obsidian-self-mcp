@@ -1,7 +1,10 @@
 """Async CouchDB client for Obsidian vault operations."""
 
+import asyncio
 import base64
+import json
 import logging
+import os
 import time
 import urllib.parse
 from collections import defaultdict
@@ -27,6 +30,42 @@ BINARY_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf",
     ".mp3", ".mp4", ".wav", ".zip", ".tar", ".gz",
 }
+
+# node_writer/ is the real livesync-commonlib-backed writer (via a vendored
+# fanselau/obsidian-vault-cli submodule) that write_note()/append_note() delegate
+# plain-text writes to, instead of this module's own generate_chunk_id()+raw-PUT
+# path. See ISA 20260728-180000_travel-resilient-vault-sync-architecture,
+# ISC-46/47/49 — the delegation exists because chunk IDs must be real
+# xxhash64-based (content-addressed) to avoid unbounded chunk-doc bloat, and
+# because raw PUTs bypass LiveSync's replication-safe write path entirely.
+#
+# Writes go to a long-lived warm daemon (node_writer/src/daemon.ts) over a
+# Unix socket, not a per-write subprocess spawn — ISC-54 costed this out and
+# found it eliminates the exit-13 CPU-starvation failure mode entirely under
+# the same concurrency test that reliably reproduced it on the subprocess
+# path (2026-07-30, 16/16 real writes across two 8-way bursts, zero
+# failures). The daemon is multi-DB: credentials and db name travel per
+# request, same as before, so one daemon instance serves dev and production
+# without being hardcoded to either.
+_WRITE_DAEMON_SOCK = os.environ.get(
+    "OBSIDIAN_WRITE_DAEMON_SOCK",
+    os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "obsidian-write-daemon.sock"),
+)
+_WRITE_DAEMON_TIMEOUT_SECONDS = float(os.environ.get("OBSIDIAN_WRITE_TIMEOUT_SECONDS", "30"))
+_WRITE_DAEMON_RETRY_DELAY_SECONDS = float(os.environ.get("OBSIDIAN_WRITE_DAEMON_RETRY_DELAY", "3"))
+
+
+class NodeWriterError(RuntimeError):
+    """Raised when the delegated warm-daemon writer fails, is unreachable, or times out.
+
+    Caller-visible by design (ISC-46): distinguishes "daemon down" (ENOENT/
+    ECONNREFUSED, retried once per Q3's health/liveness answer, matching
+    systemd's RestartSec window) from a write-level failure or timeout the
+    daemon itself reports. The daemon's response is an explicit {ok: bool}
+    JSON value, not a stdout-marker heuristic — the old subprocess model's
+    exit-0-masking/indeterminate-outcome handling (2026-07-29 Decisions) no
+    longer applies; a socket response is unambiguous.
+    """
 
 
 def _replace_wikilink_target(content: str, old_name: str, new_name: str) -> str:
@@ -60,6 +99,7 @@ class ObsidianVaultClient:
         self.config = config or Config()
         self._client: httpx.AsyncClient | None = None
         self._last_ntfy_time: float = 0.0
+        self._write_locks: dict[str, asyncio.Lock] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -207,21 +247,52 @@ class ObsidianVaultClient:
 
     # ── Read operations ────────────────────────────────────────────
 
-    async def list_notes(
-        self, folder: str | None = None, limit: int = 50, skip: int = 0
-    ) -> list[NoteMetadata]:
-        """List notes, optionally filtered by folder prefix."""
+    async def _get_matching_docs(self, folder: str | None = None) -> list[dict]:
+        """The complete, unsliced set of file docs matching an optional folder
+        filter. _get_all_file_docs() already fetches everything from CouchDB
+        with no server-side limit — the only truncation in this codebase was
+        list_notes() silently slicing this already-complete list down to
+        `limit` with no signal to the caller. Shared here so list_notes() and
+        count_notes() can never disagree about what "all" means.
+        """
         all_docs = await self._get_all_file_docs()
-
         if folder:
             folder_lower = folder.strip("/").lower() + "/"
             all_docs = [
                 d for d in all_docs
                 if d.get("path", d.get("_id", "")).lower().startswith(folder_lower)
             ]
-
-        # Sort by mtime descending
         all_docs.sort(key=lambda d: d.get("mtime", 0), reverse=True)
+        return all_docs
+
+    async def count_notes(self, folder: str | None = None) -> int:
+        """The real, complete, non-paginated count of notes matching an
+        optional folder filter — the safe replacement for "does N look like
+        the true total" guesswork against list_notes()'s (or the CLI's/MCP
+        tool's) sliced output. Found live, 2026-07-30: an audit trusted
+        `obsidian list`'s bare output as complete, silently missing 22 real
+        files hidden past the default limit=50 slice, before being caught by
+        an independent CouchDB _all_docs cross-check. This function IS that
+        cross-check, built in rather than something the caller has to
+        remember to do by hand.
+        """
+        docs = await self._get_matching_docs(folder)
+        return len(docs)
+
+    async def list_notes(
+        self, folder: str | None = None, limit: int = 50, skip: int = 0
+    ) -> list[NoteMetadata]:
+        """List notes, optionally filtered by folder prefix.
+
+        `limit`/`skip` are for genuine pagination (a human browsing a large
+        folder) — they are NOT safe to treat as "if I get back fewer than
+        limit, that's everything." Callers that need to know the true total
+        (existence checks, audits, "does X still have a file" questions)
+        must call count_notes() as well, or use list_notes_all(), never infer
+        completeness from len(results) < limit or from the absence of any
+        truncation warning in this function's own return value.
+        """
+        all_docs = await self._get_matching_docs(folder)
 
         results = []
         for doc in all_docs[skip : skip + limit]:
@@ -235,14 +306,54 @@ class ObsidianVaultClient:
             ))
         return results
 
-    async def read_note(self, path: str) -> NoteContent | None:
-        """Read a note's full content by reassembling chunks in order."""
+    async def list_notes_all(self, folder: str | None = None) -> list[NoteMetadata]:
+        """list_notes() with no slicing at all — the complete, accurate
+        result set. _get_matching_docs() already has everything in memory
+        before any limit is applied, so this costs nothing extra over
+        list_notes(); it just never throws part of the answer away. Prefer
+        this (or count_notes()) over list_notes() for anything where an
+        incomplete answer would be wrong, not just less convenient.
+        """
+        all_docs = await self._get_matching_docs(folder)
+        return [
+            NoteMetadata(
+                path=doc.get("path", doc["_id"]),
+                size=doc.get("size", 0),
+                ctime=doc.get("ctime", 0),
+                mtime=doc.get("mtime", 0),
+                doc_type=doc.get("type", "plain"),
+                chunk_count=len(doc.get("children", [])),
+            )
+            for doc in all_docs
+        ]
+
+    async def read_note(self, path: str, strict: bool = False) -> NoteContent | None:
+        """Read a note's full content by reassembling chunks in order.
+
+        `strict=True` raises ValueError if any chunk_id in `children` has no
+        corresponding fetched chunk (missing, tombstoned, or replication-
+        lagged), instead of silently reassembling a gap as "" (Forge review
+        S2). Default stays non-strict for existing callers (e.g. the
+        `read_note` MCP tool) that expect a best-effort read; callers that
+        write the reassembled content back (`append_note`) must pass
+        strict=True, since a silent gap there becomes permanent data loss
+        rather than just a bad read.
+        """
         doc = await self._get_doc(path)
         if not doc:
             return None
 
         chunk_ids = doc.get("children", [])
         chunks = await self._fetch_chunks(chunk_ids)
+
+        if strict:
+            missing = [cid for cid in chunk_ids if cid not in chunks]
+            if missing:
+                raise ValueError(
+                    f"read_note(strict=True) for {path!r}: {len(missing)} of {len(chunk_ids)} "
+                    f"chunks missing/unfetchable ({missing[:3]}{'...' if len(missing) > 3 else ''}) "
+                    f"— refusing to reassemble a gap that a write-back would make permanent"
+                )
 
         # Reassemble in order
         content_parts = [chunks.get(cid, "") for cid in chunk_ids]
@@ -294,20 +405,129 @@ class ObsidianVaultClient:
                     headers={"Title": "Obsidian Sync", "Priority": "low", "Tags": "notebook"},
                 )
         except Exception:
-            pass
+            logger.warning("_notify_livesync failed (non-fatal, sync-wake only)", exc_info=True)
 
     # ── Write operations ───────────────────────────────────────────
 
-    async def write_note(
+    def _get_write_lock(self, vault_path: str) -> asyncio.Lock:
+        """Per-canonical-path lock — prevents two concurrent delegated writes
+        (or a write racing an append's read-then-write window) from
+        interleaving on the same note (Forge review S7, 2026-07-29)."""
+        key = vault_path.lower()
+        lock = self._write_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[key] = lock
+        return lock
+
+    async def _delegate_write(self, path: str, content: str) -> None:
+        """Write plain-text content via the real livesync-commonlib writer.
+
+        Sends {path, content} plus this call's own couch_url/user/pass/
+        db_name over a Unix socket to the warm write daemon
+        (node_writer/src/daemon.ts), which holds a persistent
+        DirectFileManipulator connection per (couchUrl, dbName) pair and
+        uses the actual xxhash64 content-addressed chunking instead of this
+        module's random generate_chunk_id(). Raises NodeWriterError on any
+        confirmed failure — daemon unreachable after one retry, a write-
+        level error the daemon reports, or a timeout on the daemon's
+        response.
+
+        Health/liveness (Q3, ISC-54): connecting to a dead/restarting
+        daemon fails immediately and cleanly (ENOENT if the socket file is
+        gone — clean shutdown; ECONNREFUSED if it's stale — a crash), never
+        a hang, per direct testing of both failure modes during the daemon
+        costing prototype. One retry after a short delay covers systemd's
+        RestartSec window; a second failure is treated as a real outage,
+        not retried further, so a caller doesn't silently stall.
+        """
+        if not (self.config.couch_url and self.config.couch_user and self.config.couch_pass and self.config.db_name):
+            raise NodeWriterError(
+                f"refusing to delegate write for {path!r}: one or more of couch_url/couch_user/"
+                f"couch_pass/db_name is empty — an empty COUCHDB_URL would silently diverge from "
+                f"whatever this Config actually points reads at (Forge review S5, carried forward "
+                f"from the subprocess design)"
+            )
+
+        request = {
+            "op": "write",
+            "couchUrl": self.config.couch_url,
+            "couchUser": self.config.couch_user,
+            "couchPass": self.config.couch_pass,
+            "dbName": self.config.db_name,
+            "path": path,
+            "content": content,
+        }
+        payload = (json.dumps(request) + "\n").encode("utf-8")
+
+        async def _one_attempt() -> dict:
+            reader, writer = await asyncio.open_unix_connection(_WRITE_DAEMON_SOCK)
+            try:
+                writer.write(payload)
+                await writer.drain()
+                line = await asyncio.wait_for(reader.readline(), timeout=_WRITE_DAEMON_TIMEOUT_SECONDS)
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            if not line:
+                raise NodeWriterError(
+                    f"write daemon closed the connection without a response for {path!r} "
+                    f"(socket={_WRITE_DAEMON_SOCK}) — daemon may have crashed mid-write; "
+                    f"whether the write landed is NOT known, content-addressed chunks make a "
+                    f"retry largely safe, but the entry-doc revision is not."
+                )
+            return json.loads(line.decode("utf-8"))
+
+        try:
+            resp = await _one_attempt()
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            logger.warning(
+                "write daemon unreachable (%s) on first attempt for %r, retrying in %.1fs",
+                type(exc).__name__, path, _WRITE_DAEMON_RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(_WRITE_DAEMON_RETRY_DELAY_SECONDS)
+            try:
+                resp = await _one_attempt()
+            except (FileNotFoundError, ConnectionRefusedError) as exc2:
+                raise NodeWriterError(
+                    f"write daemon unreachable at {_WRITE_DAEMON_SOCK} writing {path!r} after 1 retry "
+                    f"({type(exc2).__name__}) — daemon is down or the socket path is misconfigured; "
+                    f"no write was attempted, this is a clean pre-write failure, not indeterminate."
+                ) from exc2
+        except asyncio.TimeoutError:
+            raise NodeWriterError(
+                f"write daemon did not respond within {_WRITE_DAEMON_TIMEOUT_SECONDS}s writing {path!r} "
+                f"— the daemon has its own shorter internal write timeout and poisons/reconnects its "
+                f"connection for this db on timeout, so a stuck write does not wedge subsequent calls, "
+                f"but whether THIS write landed before the daemon gave up is NOT known; content-"
+                f"addressed chunks make a retry largely safe, but the entry-doc revision is not."
+            )
+
+        if not resp.get("ok"):
+            raise NodeWriterError(f"write daemon reported failure for {path!r}: {resp.get('error')}")
+
+    async def _write_note_raw_put(
         self, path: str, content: str, is_binary: bool = False
     ) -> bool:
-        """Create or update a note. Returns True on success."""
+        """Original generate_chunk_id()+raw-PUT writer (pre-delegation).
+
+        Kept for two callers that must NOT go through `_delegate_write`:
+        binary writes (vendored CLI's `write` command has no base64/chunked
+        support), and `rename_note` (deliberately excluded from delegation —
+        ISC-47's scope narrowing found rename's write half unassessed
+        against the new path, and Forge's S3 finding confirmed rename_note
+        would otherwise inherit N-sequential-subprocess latency plus an
+        unconditional old-entry-delete after a partial backlink-write
+        failure — both real risks this session did not sign up to fix).
+        """
         client = await self._get_client()
         vault_path = path.lstrip("/")
         doc_id = normalize_doc_id(vault_path)
         encoded_id = encode_doc_id(doc_id)
 
-        # Prepare chunks
         if is_binary:
             raw = content.encode("utf-8") if isinstance(content, str) else content
             encoded_content = base64.b64encode(raw).decode("ascii")
@@ -322,7 +542,6 @@ class ObsidianVaultClient:
             file_size = len(content.encode("utf-8"))
             doc_type = "plain"
 
-        # Create chunk docs
         chunk_ids = []
         for chunk_data in chunks_data:
             chunk_id = generate_chunk_id()
@@ -334,8 +553,6 @@ class ObsidianVaultClient:
             chunk_ids.append(chunk_id)
 
         now_ms = int(time.time() * 1000)
-
-        # Check existing doc
         existing = await self._get_doc(vault_path)
 
         if existing:
@@ -343,11 +560,9 @@ class ObsidianVaultClient:
             existing["mtime"] = now_ms
             existing["size"] = file_size
             existing["type"] = doc_type
-            # Use the existing _id for the PUT
             existing_id = encode_doc_id(existing["_id"])
             resp = await client.put(f"/{existing_id}", json=existing)
             if resp.status_code == 409:
-                # Conflict - refetch and retry once
                 fresh = await self._get_doc(vault_path)
                 if fresh:
                     fresh["children"] = chunk_ids
@@ -375,60 +590,70 @@ class ObsidianVaultClient:
         await self._notify_livesync()
         return True
 
-    async def append_note(self, path: str, content: str) -> bool:
-        """Append content to an existing note. Returns True on success."""
-        client = await self._get_client()
-
-        doc = await self._get_doc(path)
-        if not doc:
-            raise ValueError(f"Note not found: {path}")
-
-        children = doc.get("children", [])
-        if not children:
-            raise ValueError(f"Note has no chunks: {path}")
-
-        # Fetch all chunks to compute total size
-        chunks = await self._fetch_chunks(children)
-
-        # Get last chunk and append
-        last_chunk_id = children[-1]
-        last_data = chunks.get(last_chunk_id, "")
-        new_data = last_data + content
-
-        # Create new chunk with appended content
-        new_chunk_id = generate_chunk_id()
-        resp = await client.put(
-            f"/{encode_doc_id(new_chunk_id)}",
-            json={"_id": new_chunk_id, "data": new_data, "type": "leaf"},
-        )
-        resp.raise_for_status()
-
-        # Compute total size
-        total_size = 0
-        for cid in children:
-            if cid == last_chunk_id:
-                total_size += len(new_data.encode("utf-8"))
-            else:
-                total_size += len(chunks.get(cid, "").encode("utf-8"))
-
-        # Update doc
-        doc["children"][-1] = new_chunk_id
-        doc["mtime"] = int(time.time() * 1000)
-        doc["size"] = total_size
-
-        doc_encoded = encode_doc_id(doc["_id"])
-        resp = await client.put(f"/{doc_encoded}", json=doc)
-        if resp.status_code == 409:
-            fresh = await self._get_doc(path)
-            if fresh:
-                fresh["children"][-1] = new_chunk_id
-                fresh["mtime"] = int(time.time() * 1000)
-                fresh["size"] = total_size
-                fresh_id = encode_doc_id(fresh["_id"])
-                resp = await client.put(f"/{fresh_id}", json=fresh)
-        resp.raise_for_status()
+    async def _write_note_delegated_locked(self, vault_path: str, content: str) -> bool:
+        """Delegated (non-binary) write, assuming the caller already holds
+        `_get_write_lock(vault_path)`. Not exposed directly — call via
+        `write_note()`, or from `append_note()` which holds the lock across
+        its own read+write span (see there for why)."""
+        canonical_path = await self._canonicalize_path(vault_path)
+        await self._delegate_write(canonical_path, content)
         await self._notify_livesync()
         return True
+
+    async def write_note(
+        self, path: str, content: str, is_binary: bool = False
+    ) -> bool:
+        """Create or update a note. Returns True on success.
+
+        Binary writes (is_binary=True) stay on `_write_note_raw_put` — the
+        vendored node_writer's `write` command has no binary/base64
+        handling, so delegation is plain-text-only for now (ISC-47 honest
+        scope: this session assessed create/update writes, not
+        delete_note/rename_note, and binary writes were never in the
+        subprocess-delegation design's assessed scope either).
+        """
+        vault_path = path.lstrip("/")
+
+        if is_binary:
+            return await self._write_note_raw_put(vault_path, content, is_binary=True)
+
+        async with self._get_write_lock(vault_path):
+            return await self._write_note_delegated_locked(vault_path, content)
+
+    async def append_note(self, path: str, content: str) -> bool:
+        """Append content to an existing note. Returns True on success.
+
+        Reads the full current content and re-writes the whole note via the
+        delegated writer, rather than chunk-level tail manipulation — real
+        content-addressed chunking means unchanged leading chunks get the
+        same chunk IDs recomputed, so this is not the size-proportional
+        re-upload it would be under naive random-ID chunking.
+
+        Holds the write lock across the ENTIRE read-then-write span (Forge
+        review S7) — calling the public `write_note()` here instead of
+        `_write_note_delegated_locked()` directly would deadlock, since
+        `asyncio.Lock` is not reentrant and `write_note()` acquires the same
+        lock again. Without a lock spanning the read too, two concurrent
+        appends can both read the pre-append content before either writes,
+        silently losing one append (last-writer-wins on stale content) —
+        the lock exists precisely to close that window, not just to
+        serialize the final write.
+
+        Uses `strict=True` on the read (Forge review S2): a missing/
+        tombstoned/replication-lagged chunk would otherwise silently
+        reassemble as an empty gap in `read_note`'s default (non-strict)
+        mode, and this method writes that reassembly straight back as the
+        new canonical content — a transient read hole would become
+        permanent data loss instead of just a bad read.
+        """
+        vault_path = path.lstrip("/")
+        async with self._get_write_lock(vault_path):
+            note = await self.read_note(path, strict=True)
+            if not note:
+                raise ValueError(f"Note not found: {path}")
+            if note.is_binary:
+                raise ValueError(f"Cannot append to binary file: {path}")
+            return await self._write_note_delegated_locked(vault_path, note.content + content)
 
     async def delete_note(self, path: str) -> bool:
         """Delete a note and all its chunks. Returns True on success."""
@@ -517,8 +742,13 @@ class ObsidianVaultClient:
 
         # Write new file first — if this fails, no state has been mutated.
         # Also apply wikilink replacement to the content itself (handles self-links).
+        # Uses _write_note_raw_put (NOT the delegated write_note) deliberately —
+        # rename_note's write half was explicitly excluded from this session's
+        # ISC-47 scope, and Forge review S3 confirmed inheriting delegation here
+        # would add N-sequential-subprocess latency across backlinks plus an
+        # unconditional old-entry-delete after a partial backlink-write failure.
         new_content_body = _replace_wikilink_target(old_note.content, old_name, new_name)
-        await self.write_note(new_path, new_content_body)
+        await self._write_note_raw_put(new_path, new_content_body)
 
         # Update backlink sources now that new_path exists.
         updated = 0
@@ -535,7 +765,7 @@ class ObsidianVaultClient:
                     continue
                 updated_content = _replace_wikilink_target(note.content, old_name, new_name)
                 if updated_content != note.content:
-                    await self.write_note(bl.source_path, updated_content)
+                    await self._write_note_raw_put(bl.source_path, updated_content)
                     updated += 1
             except Exception as exc:
                 warnings.append(f"failed {bl.source_path}: {exc}")
@@ -543,7 +773,18 @@ class ObsidianVaultClient:
         # Soft-delete the old entry doc only — do not delete chunks.
         # LiveSync-authored notes may share content-addressed chunk IDs across files;
         # deleting chunks risks breaking unrelated notes. Orphaned chunks are harmless.
-        await self._delete_entry_doc(old_path)
+        #
+        # Adjacent pre-existing bug fixed alongside this session's delegation work
+        # (Forge review S3, 2026-07-29): this delete used to run unconditionally even
+        # when some backlink updates failed above, permanently destroying the only
+        # path back to the old note while leaving broken wikilinks behind, reported
+        # only as a substring of the returned summary. Skip it when there were
+        # warnings — old_path stays resolvable (and re-renameable) until a caller
+        # explicitly confirms the backlink warnings are acceptable.
+        if not warnings:
+            await self._delete_entry_doc(old_path)
+        else:
+            warnings.append(f"old entry {old_path} NOT deleted — backlink warnings present")
 
         result = (
             f"Renamed: {old_path} → {new_path} | "

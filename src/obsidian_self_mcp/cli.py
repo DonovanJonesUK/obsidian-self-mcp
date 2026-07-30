@@ -13,18 +13,41 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _cmd_count(client: ObsidianVaultClient, args):
+    total = await client.count_notes(folder=args.folder)
+    scope = f' under "{args.folder}"' if args.folder else ""
+    print(f"{total} notes{scope} (exact, non-paginated)")
+
+
 async def _cmd_list(client: ObsidianVaultClient, args):
-    notes = await client.list_notes(folder=args.folder, limit=args.n)
+    # Always report the true total (2026-07-30) — the old version printed
+    # len(notes) with no indication that the default limit=50 might have
+    # silently hidden the rest. That exact gap caused a real production
+    # mistake (an audit trusted this command's bare output as complete,
+    # missed 22 real files, created duplicates before an independent
+    # CouchDB check caught it). Truncation is now impossible to miss.
+    total = await client.count_notes(folder=args.folder)
+    if getattr(args, "all", False):
+        notes = await client.list_notes_all(folder=args.folder)
+    else:
+        notes = await client.list_notes(folder=args.folder, limit=args.n)
     if not notes:
         print("No notes found.")
         return
     for n in notes:
         print(f"  {n.path}  ({n.size}B, {n.chunk_count} chunks)")
-    print(f"\n{len(notes)} notes")
+    if len(notes) < total:
+        print(f"\n⚠️  Showing {len(notes)} of {total} — TRUNCATED. Use -n {total} or the `count`/`--all` path for the real total.")
+    else:
+        print(f"\n{len(notes)} notes (complete — this is all of them)")
 
 
 async def _cmd_read(client: ObsidianVaultClient, args):
-    note = await client.read_note(args.path)
+    try:
+        note = await client.read_note(args.path, strict=getattr(args, "strict", False))
+    except ValueError as e:
+        print(f"Strict read failed: {e}", file=sys.stderr)
+        sys.exit(1)
     if not note:
         print(f"Not found: {args.path}", file=sys.stderr)
         sys.exit(1)
@@ -181,11 +204,20 @@ def main():
     # list / ls
     p_list = sub.add_parser("list", aliases=["ls"], help="List notes")
     p_list.add_argument("folder", nargs="?", help="Folder to filter")
-    p_list.add_argument("-n", type=int, default=50, help="Limit (default 50)")
+    p_list.add_argument("-n", type=int, default=50, help="Limit (default 50) — for browsing only, see `count` for the true total")
+    p_list.add_argument("--all", action="store_true", help="No limit — the real, complete list (cheap: already fetched in full internally either way)")
+
+    # count — the safe replacement for "does the list output look complete"
+    p_count = sub.add_parser("count", help="Exact, non-paginated count of notes (optionally folder-filtered)")
+    p_count.add_argument("folder", nargs="?", help="Folder to filter")
 
     # read / cat
     p_read = sub.add_parser("read", aliases=["cat"], help="Read a note")
     p_read.add_argument("path", help="Vault path to the note")
+    p_read.add_argument(
+        "--strict", action="store_true",
+        help="Raise instead of silently reassembling a gap if a chunk is missing (see read_note(strict=))",
+    )
 
     # write
     p_write = sub.add_parser("write", help="Create/update a note")
@@ -245,6 +277,7 @@ def main():
 
     cmd_map = {
         "list": _cmd_list, "ls": _cmd_list,
+        "count": _cmd_count,
         "read": _cmd_read, "cat": _cmd_read,
         "write": _cmd_write,
         "search": _cmd_search, "grep": _cmd_search,

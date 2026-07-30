@@ -22,17 +22,45 @@ async def list_notes(
 ) -> str:
     """List notes in the Obsidian vault with metadata.
 
+    NOTE: this is for browsing, not counting or existence-checking — with
+    the default limit, results can be silently truncated. Use count_notes
+    for the true, non-paginated total; never infer completeness from this
+    tool's output alone (a real 2026-07-30 incident: an audit trusted this
+    tool's bare "Found N notes" line as complete and missed 22 real files).
+
     Args:
         folder: Optional folder path to filter (e.g. "Dev Projects/Arrmada")
         limit: Max notes to return (default 50)
         skip: Number of notes to skip for pagination
     """
     client = _get_client()
+    total = await client.count_notes(folder=folder)
     notes = await client.list_notes(folder=folder, limit=limit, skip=skip)
     if not notes:
         return "No notes found."
     lines = [f"{n.path}  ({n.size} bytes, {n.chunk_count} chunks)" for n in notes]
-    return f"Found {len(notes)} notes:\n" + "\n".join(lines)
+    if len(notes) < total:
+        header = f"Showing {len(notes)} of {total} — TRUNCATED, call count_notes for the real total or raise limit:"
+    else:
+        header = f"Found {len(notes)} notes (complete — this is all of them):"
+    return header + "\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def count_notes(folder: str | None = None) -> str:
+    """Exact, non-paginated count of notes in the vault (optionally
+    folder-filtered). The safe way to answer "does X exist" / "how many
+    files are there" — never truncates, never needs a limit guessed at.
+    Prefer this over list_notes whenever the actual number matters, not
+    just a browsable sample.
+
+    Args:
+        folder: Optional folder path to filter (e.g. "Dev Projects/Arrmada")
+    """
+    client = _get_client()
+    total = await client.count_notes(folder=folder)
+    scope = f' under "{folder}"' if folder else ""
+    return f"{total} notes{scope} (exact, non-paginated)"
 
 
 @mcp.tool()

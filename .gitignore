@@ -7,3 +7,4 @@ build/
 .claude/
 .env
 .env.*
+.venv/

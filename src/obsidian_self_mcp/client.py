@@ -556,10 +556,20 @@ class ObsidianVaultClient:
         existing = await self._get_doc(vault_path)
 
         if existing:
+            # `path` is otherwise create-only: prior to this fix, an update to an
+            # existing doc never touched `path`, so a doc's stored casing was frozen
+            # at whatever it was first created with, forever — regardless of what
+            # casing any later caller (including rename_note) supplied. Found
+            # 2026-08-11 tracing why case-only renames silently never took effect.
+            # Canonicalize here the same way the create branch below does: folder
+            # casing resolved from existing ancestor docs, filename casing taken
+            # from the caller's `path` argument unchanged.
+            canonical_path = await self._canonicalize_path(vault_path)
             existing["children"] = chunk_ids
             existing["mtime"] = now_ms
             existing["size"] = file_size
             existing["type"] = doc_type
+            existing["path"] = canonical_path
             existing_id = encode_doc_id(existing["_id"])
             resp = await client.put(f"/{existing_id}", json=existing)
             if resp.status_code == 409:
@@ -569,6 +579,7 @@ class ObsidianVaultClient:
                     fresh["mtime"] = now_ms
                     fresh["size"] = file_size
                     fresh["type"] = doc_type
+                    fresh["path"] = canonical_path
                     fresh_id = encode_doc_id(fresh["_id"])
                     resp = await client.put(f"/{fresh_id}", json=fresh)
             resp.raise_for_status()
@@ -723,8 +734,16 @@ class ObsidianVaultClient:
         if not old_doc:
             raise ValueError(f"Source note not found: {old_path}")
 
+        # CouchDB doc IDs are always fully lowercased (normalize_doc_id), so a
+        # case-only rename (e.g. "bch_cstate.md" -> "BCH_Cstate.md") computes the
+        # *same* _id for old_path and new_path — old_doc and new_doc below are the
+        # same underlying document, not a genuine conflict. Found 2026-08-11: this
+        # used to be indistinguishable from "destination already exists" and
+        # unconditionally rejected every case-only rename.
+        same_underlying_doc = normalize_doc_id(old_path) == normalize_doc_id(new_path)
+
         new_doc = await self._get_doc(new_path)
-        if new_doc:
+        if new_doc and not same_underlying_doc:
             raise ValueError(f"Destination already exists: {new_path}")
 
         old_name = old_path.rsplit("/", 1)[-1]
@@ -781,7 +800,15 @@ class ObsidianVaultClient:
         # only as a substring of the returned summary. Skip it when there were
         # warnings — old_path stays resolvable (and re-renameable) until a caller
         # explicitly confirms the backlink warnings are acceptable.
-        if not warnings:
+        # Case-only rename: old_path and new_path are the same _id, and the
+        # _write_note_raw_put call above already updated that single document in
+        # place (new path casing, new content). Deleting "old_path" here would
+        # delete that same just-written document — found 2026-08-11 while fixing
+        # the case-only-rename path; would have silently destroyed every case-only
+        # rename immediately after correctly performing it.
+        if same_underlying_doc:
+            pass
+        elif not warnings:
             await self._delete_entry_doc(old_path)
         else:
             warnings.append(f"old entry {old_path} NOT deleted — backlink warnings present")

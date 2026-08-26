@@ -117,25 +117,37 @@ class ObsidianVaultClient:
 
     # ── Low-level helpers ──────────────────────────────────────────
 
-    async def _get_doc(self, path: str) -> dict | None:
-        """Fetch a doc by vault path, trying both ID conventions."""
+    async def _get_doc(self, path: str, *, include_deleted: bool = False) -> dict | None:
+        """Fetch a doc by vault path, trying both ID conventions.
+
+        By default, filters out LiveSync-tombstoned documents (`deleted: true`
+        on the doc's current revision — an app-level soft-delete flag LiveSync
+        sets when a note is deleted client-side, distinct from a real CouchDB
+        delete: the doc still returns 200 with its content chunks attached).
+        See SAI-OQ-065. Pass include_deleted=True for the rare case a caller
+        explicitly wants a tombstone (e.g. auditing what was deleted).
+        """
         client = await self._get_client()
         doc_id = normalize_doc_id(path)
 
         # Try normalized ID first (handles '_' prefix → '/_' automatically)
         resp = await client.get(f"/{encode_doc_id(doc_id)}")
         if resp.status_code == 200:
-            return resp.json()
+            doc = resp.json()
+            if include_deleted or not doc.get("deleted"):
+                return doc
 
         # Try alternate convention (with/without leading slash)
         alt_id = "/" + doc_id if not doc_id.startswith("/") else doc_id[1:]
         resp = await client.get(f"/{encode_doc_id(alt_id)}")
         if resp.status_code == 200:
-            return resp.json()
+            doc = resp.json()
+            if include_deleted or not doc.get("deleted"):
+                return doc
 
         # Fallback: search by path field (for hash-ID format f:... used by newer LiveSync)
         path_lower = path.lower()
-        all_docs = await self._get_all_file_docs()
+        all_docs = await self._get_all_file_docs(include_deleted=include_deleted)
         for doc in all_docs:
             if doc.get("path", "").lower() == path_lower:
                 return doc
@@ -209,8 +221,16 @@ class ObsidianVaultClient:
                 result[row["id"]] = doc["data"]
         return result
 
-    async def _get_all_file_docs(self) -> list[dict]:
-        """Fetch all file docs (skip chunks, design docs, index docs)."""
+    async def _get_all_file_docs(self, *, include_deleted: bool = False) -> list[dict]:
+        """Fetch all file docs (skip chunks, design docs, index docs).
+
+        By default, filters out LiveSync-tombstoned documents (`deleted: true`
+        on the doc's current revision) — see SAI-OQ-065. These are live
+        CouchDB docs (content chunks still attached, standard `type`/
+        `children` shape), not `_all_docs`-level deletions, so they passed
+        every other check here and were previously indistinguishable from
+        real live notes to every method built on this one.
+        """
         client = await self._get_client()
         docs = []
 
@@ -227,7 +247,8 @@ class ObsidianVaultClient:
         for row in resp.json().get("rows", []):
             doc = row.get("doc", {})
             if doc.get("type") in ("plain", "newnote") and "children" in doc:
-                docs.append(doc)
+                if include_deleted or not doc.get("deleted"):
+                    docs.append(doc)
 
         # Range 2: docs after "h:~" (after all chunks)
         resp = await client.get(
@@ -241,13 +262,16 @@ class ObsidianVaultClient:
         for row in resp.json().get("rows", []):
             doc = row.get("doc", {})
             if doc.get("type") in ("plain", "newnote") and "children" in doc:
-                docs.append(doc)
+                if include_deleted or not doc.get("deleted"):
+                    docs.append(doc)
 
         return docs
 
     # ── Read operations ────────────────────────────────────────────
 
-    async def _get_matching_docs(self, folder: str | None = None) -> list[dict]:
+    async def _get_matching_docs(
+        self, folder: str | None = None, *, include_deleted: bool = False
+    ) -> list[dict]:
         """The complete, unsliced set of file docs matching an optional folder
         filter. _get_all_file_docs() already fetches everything from CouchDB
         with no server-side limit — the only truncation in this codebase was
@@ -255,7 +279,7 @@ class ObsidianVaultClient:
         `limit` with no signal to the caller. Shared here so list_notes() and
         count_notes() can never disagree about what "all" means.
         """
-        all_docs = await self._get_all_file_docs()
+        all_docs = await self._get_all_file_docs(include_deleted=include_deleted)
         if folder:
             folder_lower = folder.strip("/").lower() + "/"
             all_docs = [
@@ -265,7 +289,9 @@ class ObsidianVaultClient:
         all_docs.sort(key=lambda d: d.get("mtime", 0), reverse=True)
         return all_docs
 
-    async def count_notes(self, folder: str | None = None) -> int:
+    async def count_notes(
+        self, folder: str | None = None, *, include_deleted: bool = False
+    ) -> int:
         """The real, complete, non-paginated count of notes matching an
         optional folder filter — the safe replacement for "does N look like
         the true total" guesswork against list_notes()'s (or the CLI's/MCP
@@ -276,11 +302,16 @@ class ObsidianVaultClient:
         cross-check, built in rather than something the caller has to
         remember to do by hand.
         """
-        docs = await self._get_matching_docs(folder)
+        docs = await self._get_matching_docs(folder, include_deleted=include_deleted)
         return len(docs)
 
     async def list_notes(
-        self, folder: str | None = None, limit: int = 50, skip: int = 0
+        self,
+        folder: str | None = None,
+        limit: int = 50,
+        skip: int = 0,
+        *,
+        include_deleted: bool = False,
     ) -> list[NoteMetadata]:
         """List notes, optionally filtered by folder prefix.
 
@@ -292,7 +323,7 @@ class ObsidianVaultClient:
         completeness from len(results) < limit or from the absence of any
         truncation warning in this function's own return value.
         """
-        all_docs = await self._get_matching_docs(folder)
+        all_docs = await self._get_matching_docs(folder, include_deleted=include_deleted)
 
         results = []
         for doc in all_docs[skip : skip + limit]:
@@ -306,7 +337,9 @@ class ObsidianVaultClient:
             ))
         return results
 
-    async def list_notes_all(self, folder: str | None = None) -> list[NoteMetadata]:
+    async def list_notes_all(
+        self, folder: str | None = None, *, include_deleted: bool = False
+    ) -> list[NoteMetadata]:
         """list_notes() with no slicing at all — the complete, accurate
         result set. _get_matching_docs() already has everything in memory
         before any limit is applied, so this costs nothing extra over
@@ -314,7 +347,7 @@ class ObsidianVaultClient:
         this (or count_notes()) over list_notes() for anything where an
         incomplete answer would be wrong, not just less convenient.
         """
-        all_docs = await self._get_matching_docs(folder)
+        all_docs = await self._get_matching_docs(folder, include_deleted=include_deleted)
         return [
             NoteMetadata(
                 path=doc.get("path", doc["_id"]),
@@ -327,7 +360,9 @@ class ObsidianVaultClient:
             for doc in all_docs
         ]
 
-    async def read_note(self, path: str, strict: bool = False) -> NoteContent | None:
+    async def read_note(
+        self, path: str, strict: bool = False, *, include_deleted: bool = False
+    ) -> NoteContent | None:
         """Read a note's full content by reassembling chunks in order.
 
         `strict=True` raises ValueError if any chunk_id in `children` has no
@@ -338,8 +373,11 @@ class ObsidianVaultClient:
         write the reassembled content back (`append_note`) must pass
         strict=True, since a silent gap there becomes permanent data loss
         rather than just a bad read.
+
+        `include_deleted` (SAI-OQ-065) defaults to False — a LiveSync
+        tombstone reads as "not found," same as a genuinely absent note.
         """
-        doc = await self._get_doc(path)
+        doc = await self._get_doc(path, include_deleted=include_deleted)
         if not doc:
             return None
 
@@ -553,7 +591,12 @@ class ObsidianVaultClient:
             chunk_ids.append(chunk_id)
 
         now_ms = int(time.time() * 1000)
-        existing = await self._get_doc(vault_path)
+        # include_deleted=True: this is a write-mechanics existence/rev lookup
+        # ("does a doc already occupy this _id, so I know PUT-with-rev vs
+        # PUT-new"), not the read-path visibility filter SAI-OQ-065 added
+        # elsewhere. A tombstoned doc still occupies the _id and still has a
+        # _rev that must be reused, or the PUT below 409s against it.
+        existing = await self._get_doc(vault_path, include_deleted=True)
 
         if existing:
             # `path` is otherwise create-only: prior to this fix, an update to an
@@ -570,16 +613,20 @@ class ObsidianVaultClient:
             existing["size"] = file_size
             existing["type"] = doc_type
             existing["path"] = canonical_path
+            # Resurrect: writing content to a path clears any LiveSync
+            # tombstone on it, since the note is live again (SAI-OQ-065).
+            existing["deleted"] = False
             existing_id = encode_doc_id(existing["_id"])
             resp = await client.put(f"/{existing_id}", json=existing)
             if resp.status_code == 409:
-                fresh = await self._get_doc(vault_path)
+                fresh = await self._get_doc(vault_path, include_deleted=True)
                 if fresh:
                     fresh["children"] = chunk_ids
                     fresh["mtime"] = now_ms
                     fresh["size"] = file_size
                     fresh["type"] = doc_type
                     fresh["path"] = canonical_path
+                    fresh["deleted"] = False
                     fresh_id = encode_doc_id(fresh["_id"])
                     resp = await client.put(f"/{fresh_id}", json=fresh)
             resp.raise_for_status()
@@ -667,10 +714,17 @@ class ObsidianVaultClient:
             return await self._write_note_delegated_locked(vault_path, note.content + content)
 
     async def delete_note(self, path: str) -> bool:
-        """Delete a note and all its chunks. Returns True on success."""
+        """Delete a note and all its chunks. Returns True on success.
+
+        Looks up the doc with include_deleted=True (SAI-OQ-065): a delete
+        must still find and act on an already-tombstoned doc — that's a
+        write-mechanics existence lookup, not the read-path visibility
+        filter — so a caller can still purge chunks/entry for a note LiveSync
+        already soft-deleted, rather than getting a spurious "Note not found."
+        """
         client = await self._get_client()
 
-        doc = await self._get_doc(path)
+        doc = await self._get_doc(path, include_deleted=True)
         if not doc:
             raise ValueError(f"Note not found: {path}")
 
@@ -691,7 +745,7 @@ class ObsidianVaultClient:
         doc_encoded = encode_doc_id(doc["_id"])
         resp = await client.delete(f"/{doc_encoded}", params={"rev": doc_rev})
         if resp.status_code == 409:
-            fresh = await self._get_doc(path)
+            fresh = await self._get_doc(path, include_deleted=True)
             if fresh:
                 fresh_id = encode_doc_id(fresh["_id"])
                 resp = await client.delete(
@@ -706,15 +760,19 @@ class ObsidianVaultClient:
         Used by rename_note to avoid deleting chunks that may be shared across
         LiveSync-authored notes with identical content (content-addressed chunk IDs).
         Orphaned chunks are harmless — LiveSync GC handles them.
+
+        include_deleted=True (SAI-OQ-065): same write-mechanics reasoning as
+        delete_note — this must find the old entry doc regardless of tombstone
+        state to clean it up after a rename.
         """
         client = await self._get_client()
-        doc = await self._get_doc(path)
+        doc = await self._get_doc(path, include_deleted=True)
         if not doc:
             return
         doc_encoded = encode_doc_id(doc["_id"])
         resp = await client.delete(f"/{doc_encoded}", params={"rev": doc["_rev"]})
         if resp.status_code == 409:
-            fresh = await self._get_doc(path)
+            fresh = await self._get_doc(path, include_deleted=True)
             if fresh:
                 fresh_id = encode_doc_id(fresh["_id"])
                 await client.delete(f"/{fresh_id}", params={"rev": fresh["_rev"]})
@@ -742,6 +800,12 @@ class ObsidianVaultClient:
         # unconditionally rejected every case-only rename.
         same_underlying_doc = normalize_doc_id(old_path) == normalize_doc_id(new_path)
 
+        # include_deleted defaults to False here deliberately (SAI-OQ-065):
+        # a LiveSync-tombstoned new_path must NOT count as "already exists" —
+        # that was the exact false-positive collision this bug caused
+        # (feedback_livesync_tombstone_rename_collision). The write below
+        # (_write_note_raw_put) looks the doc up again with include_deleted=
+        # True to correctly resurrect/overwrite it if it was a tombstone.
         new_doc = await self._get_doc(new_path)
         if new_doc and not same_underlying_doc:
             raise ValueError(f"Destination already exists: {new_path}")
@@ -894,9 +958,13 @@ class ObsidianVaultClient:
 
     # ── Frontmatter operations ─────────────────────────────────────
 
-    async def read_frontmatter(self, path: str) -> dict | None:
-        """Read and parse frontmatter from a note. Returns None if no frontmatter."""
-        note = await self.read_note(path)
+    async def read_frontmatter(
+        self, path: str, *, include_deleted: bool = False
+    ) -> dict | None:
+        """Read and parse frontmatter from a note. Returns None if no frontmatter
+        (or if the note itself doesn't exist / is a filtered-out tombstone —
+        see read_note's include_deleted)."""
+        note = await self.read_note(path, include_deleted=include_deleted)
         if not note or note.is_binary:
             return None
         fm, _ = extract_frontmatter(note.content)

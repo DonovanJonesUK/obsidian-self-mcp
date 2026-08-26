@@ -26,11 +26,12 @@ async def _cmd_list(client: ObsidianVaultClient, args):
     # mistake (an audit trusted this command's bare output as complete,
     # missed 22 real files, created duplicates before an independent
     # CouchDB check caught it). Truncation is now impossible to miss.
-    total = await client.count_notes(folder=args.folder)
+    include_deleted = getattr(args, "include_deleted", False)
+    total = await client.count_notes(folder=args.folder, include_deleted=include_deleted)
     if getattr(args, "all", False):
-        notes = await client.list_notes_all(folder=args.folder)
+        notes = await client.list_notes_all(folder=args.folder, include_deleted=include_deleted)
     else:
-        notes = await client.list_notes(folder=args.folder, limit=args.n)
+        notes = await client.list_notes(folder=args.folder, limit=args.n, include_deleted=include_deleted)
     if not notes:
         print("No notes found.")
         return
@@ -44,7 +45,11 @@ async def _cmd_list(client: ObsidianVaultClient, args):
 
 async def _cmd_read(client: ObsidianVaultClient, args):
     try:
-        note = await client.read_note(args.path, strict=getattr(args, "strict", False))
+        note = await client.read_note(
+            args.path,
+            strict=getattr(args, "strict", False),
+            include_deleted=getattr(args, "include_deleted", False),
+        )
     except ValueError as e:
         print(f"Strict read failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -122,7 +127,9 @@ async def _cmd_props(client: ObsidianVaultClient, args):
         await client.update_frontmatter(args.path, properties)
         print(f"Updated frontmatter for: {args.path}")
     else:
-        fm = await client.read_frontmatter(args.path)
+        fm = await client.read_frontmatter(
+            args.path, include_deleted=getattr(args, "include_deleted", False)
+        )
         if fm is None:
             print(f"No frontmatter in: {args.path}")
             return
@@ -206,6 +213,7 @@ def main():
     p_list.add_argument("folder", nargs="?", help="Folder to filter")
     p_list.add_argument("-n", type=int, default=50, help="Limit (default 50) — for browsing only, see `count` for the true total")
     p_list.add_argument("--all", action="store_true", help="No limit — the real, complete list (cheap: already fetched in full internally either way)")
+    p_list.add_argument("--include-deleted", action="store_true", help="Include LiveSync-tombstoned (deleted:true) documents, normally filtered out (SAI-OQ-065)")
 
     # count — the safe replacement for "does the list output look complete"
     p_count = sub.add_parser("count", help="Exact, non-paginated count of notes (optionally folder-filtered)")
@@ -218,6 +226,7 @@ def main():
         "--strict", action="store_true",
         help="Raise instead of silently reassembling a gap if a chunk is missing (see read_note(strict=))",
     )
+    p_read.add_argument("--include-deleted", action="store_true", help="Include LiveSync-tombstoned (deleted:true) documents, normally filtered out (SAI-OQ-065)")
 
     # write
     p_write = sub.add_parser("write", help="Create/update a note")
@@ -246,6 +255,7 @@ def main():
     p_props = sub.add_parser("props", help="Read/set frontmatter properties")
     p_props.add_argument("path", help="Vault path to the note")
     p_props.add_argument("--set", nargs="+", metavar="KEY=VALUE", help="Set properties")
+    p_props.add_argument("--include-deleted", action="store_true", help="Include LiveSync-tombstoned (deleted:true) documents, normally filtered out (SAI-OQ-065)")
 
     # tags
     p_tags = sub.add_parser("tags", help="List tags or find notes by tag")

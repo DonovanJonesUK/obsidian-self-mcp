@@ -714,68 +714,120 @@ class ObsidianVaultClient:
             return await self._write_note_delegated_locked(vault_path, note.content + content)
 
     async def delete_note(self, path: str) -> bool:
-        """Delete a note and all its chunks. Returns True on success.
+        """Soft-delete a note the way LiveSync itself does. Returns True on success.
 
-        Looks up the doc with include_deleted=True (SAI-OQ-065): a delete
-        must still find and act on an already-tombstoned doc — that's a
-        write-mechanics existence lookup, not the read-path visibility
-        filter — so a caller can still purge chunks/entry for a note LiveSync
-        already soft-deleted, rather than getting a spurious "Note not found."
+        Sets `deleted: true` on the entry document and bumps `mtime`, leaving
+        `children`, the chunk id list, entirely untouched. This is the same write
+        livesync-commonlib performs for `newnote`/`plain` documents in
+        `deleteDBEntryByPath` (EntryManagerImpls.ts): chunks are never deleted, and
+        even LiveSync's own `deleteMetadataOfDeletedFiles` setting only escalates to
+        a CouchDB `_deleted` on the *entry* doc, never on a chunk. Because it is the
+        same write a real client makes, it propagates to Obsidian by construction
+        rather than by hoping a direct CouchDB delete reaches the app's view.
+
+        SAI-OQ-074. Until 2026-09-06 this method issued an unconditional DELETE for
+        every id in `children`. LiveSync chunk ids are content-addressed, so
+        byte-identical content across notes resolves to ONE shared chunk document -
+        deleting any note destroyed chunks that other notes still referenced,
+        truncating them mid-word, returning success, logging nothing. Measured on
+        production 2026-08-28: 9,176 of 98,256 chunks (9.34%) multi-referenced,
+        4,369 of 13,408 notes (32.6%) unsafe to delete, worst chunk referenced by
+        521 notes. Confirmed inherited from upstream, not a local regression.
+
+        Soft delete also changes the cost of the stale-revision race that both write
+        paths share. A hard DELETE on a stale rev destroys a revision nobody read -
+        the retry removes whatever is current, which may be content written between
+        our read and our delete. A soft delete on a stale rev merely *flags* that
+        revision, leaves `children` intact, and is undone by writing to the path
+        again (`_write_note_raw_put` clears the flag, SAI-OQ-065). The failure mode
+        moves from silent destruction to a reversible flag.
+
+        Read paths already filter these documents out (SAI-OQ-065), so a soft-deleted
+        note is invisible to read_note/list_notes/search/count_notes exactly as a
+        removed one was. There is deliberately NO purge counterpart: every
+        hard-delete path in this system has produced a defect, LiveSync performs
+        essentially none, and an entry-doc purge would not touch the orphaned chunk
+        documents that are the only thing genuinely accumulating (VPSO-OQ-067).
+
+        Holds the write lock for the same reason the other write paths do: without
+        it a concurrent write_note and delete_note on one path interleave, and
+        last-writer-wins decides whether the note exists.
+
+        include_deleted=True on the lookup: a delete must still find an
+        already-tombstoned doc, which makes re-deleting idempotent rather than a
+        spurious "Note not found."
+        """
+        vault_path = path.lstrip("/")
+
+        async with self._get_write_lock(vault_path):
+            found = await self._soft_delete_entry_doc(vault_path, missing_ok=True)
+            if not found:
+                raise ValueError(f"Note not found: {path}")
+            await self._notify_livesync()
+            return True
+
+    async def _soft_delete_entry_doc(
+        self, vault_path: str, *, missing_ok: bool = False
+    ) -> bool:
+        """Flag a note's entry document deleted, LiveSync-style. Chunks untouched.
+
+        THE ONLY PLACE IN THIS CLIENT THAT REMOVES A NOTE. Both `delete_note` and
+        `rename_note` route through here so there is exactly one implementation of
+        "make a note go away" and the two cannot drift apart, the drift is what
+        SAI-OQ-074 was: `rename_note` was chunk-safe, `delete_note` was not, and
+        the safe method sat one function away from the unsafe one for two months
+        without being reached for.
+
+        Writes what livesync-commonlib's `deleteDBEntryByPath` writes for
+        `newnote`/`plain` documents (EntryManagerImpls.ts): `deleted: true`,
+        `mtime` bumped, `children` left completely alone. Chunk documents are never
+        deleted here, LiveSync chunk ids are content-addressed, so byte-identical
+        content across notes resolves to one shared chunk, and deleting it truncates
+        every other note that references it. Orphaned chunks are harmless and
+        LiveSync GC handles them; a note with its body silently removed is not
+        harmless and nothing handles it.
+
+        Replaces the previous `_delete_entry_doc`, which issued a hard CouchDB
+        `DELETE` on the entry document. That was chunk-safe but carried two further
+        defects this does not: a direct CouchDB delete may not reach Obsidian's own
+        view of the vault, and on a 409 the retry deleted whatever revision was
+        current, destroying an edit written between our read and our delete, which
+        during a rename is the only remaining copy of the note. A soft delete on a
+        stale revision merely flags it, and is undone by writing to the path again.
+
+        Lock-free by design. Callers own their own locking: `delete_note` holds the
+        per-path write lock, `rename_note` sequences a multi-document mutation.
+        `asyncio.Lock` is not reentrant, so this must not acquire one itself, the
+        same split as `_write_note_delegated_locked` vs `write_note`.
+
+        `missing_ok=True` returns False for an absent path instead of raising, which
+        is what `rename_note` wants after a partial failure. Looks the doc up with
+        `include_deleted=True` (SAI-OQ-065) so re-deleting an already-tombstoned
+        note is idempotent rather than a spurious "Note not found".
         """
         client = await self._get_client()
 
-        doc = await self._get_doc(path, include_deleted=True)
+        doc = await self._get_doc(vault_path, include_deleted=True)
         if not doc:
-            raise ValueError(f"Note not found: {path}")
+            if missing_ok:
+                return False
+            raise ValueError(f"Note not found: {vault_path}")
 
-        # Delete chunks first
-        chunk_ids = doc.get("children", [])
-        for chunk_id in chunk_ids:
-            # Get chunk rev
-            resp = await client.get(f"/{encode_doc_id(chunk_id)}")
-            if resp.status_code == 200:
-                chunk_rev = resp.json().get("_rev")
-                await client.delete(
-                    f"/{encode_doc_id(chunk_id)}",
-                    params={"rev": chunk_rev},
-                )
+        def _tombstone(target: dict) -> dict:
+            # `children` is deliberately not read, not filtered, not touched.
+            target["deleted"] = True
+            target["mtime"] = int(time.time() * 1000)
+            return target
 
-        # Delete the doc
-        doc_rev = doc.get("_rev")
-        doc_encoded = encode_doc_id(doc["_id"])
-        resp = await client.delete(f"/{doc_encoded}", params={"rev": doc_rev})
+        resp = await client.put(f"/{encode_doc_id(doc['_id'])}", json=_tombstone(doc))
         if resp.status_code == 409:
-            fresh = await self._get_doc(path, include_deleted=True)
+            fresh = await self._get_doc(vault_path, include_deleted=True)
             if fresh:
-                fresh_id = encode_doc_id(fresh["_id"])
-                resp = await client.delete(
-                    f"/{fresh_id}", params={"rev": fresh["_rev"]}
+                resp = await client.put(
+                    f"/{encode_doc_id(fresh['_id'])}", json=_tombstone(fresh)
                 )
         resp.raise_for_status()
         return True
-
-    async def _delete_entry_doc(self, path: str) -> None:
-        """Delete only the top-level entry document for a note, leaving chunk docs intact.
-
-        Used by rename_note to avoid deleting chunks that may be shared across
-        LiveSync-authored notes with identical content (content-addressed chunk IDs).
-        Orphaned chunks are harmless — LiveSync GC handles them.
-
-        include_deleted=True (SAI-OQ-065): same write-mechanics reasoning as
-        delete_note — this must find the old entry doc regardless of tombstone
-        state to clean it up after a rename.
-        """
-        client = await self._get_client()
-        doc = await self._get_doc(path, include_deleted=True)
-        if not doc:
-            return
-        doc_encoded = encode_doc_id(doc["_id"])
-        resp = await client.delete(f"/{doc_encoded}", params={"rev": doc["_rev"]})
-        if resp.status_code == 409:
-            fresh = await self._get_doc(path, include_deleted=True)
-            if fresh:
-                fresh_id = encode_doc_id(fresh["_id"])
-                await client.delete(f"/{fresh_id}", params={"rev": fresh["_rev"]})
 
     async def rename_note(self, old_path: str, new_path: str) -> str:
         """Rename a note and update all wikilink backlinks at the CouchDB layer.
@@ -857,6 +909,11 @@ class ObsidianVaultClient:
         # LiveSync-authored notes may share content-addressed chunk IDs across files;
         # deleting chunks risks breaking unrelated notes. Orphaned chunks are harmless.
         #
+        # 2026-09-06 (SAI-OQ-074): this comment was accurate about intent and wrong
+        # about mechanism for two months, the helper it called hard-DELETEd the
+        # entry document rather than soft-deleting it. It now genuinely soft-deletes,
+        # through the same single writer `delete_note` uses.
+        #
         # Adjacent pre-existing bug fixed alongside this session's delegation work
         # (Forge review S3, 2026-07-29): this delete used to run unconditionally even
         # when some backlink updates failed above, permanently destroying the only
@@ -873,7 +930,27 @@ class ObsidianVaultClient:
         if same_underlying_doc:
             pass
         elif not warnings:
-            await self._delete_entry_doc(old_path)
+            # Capture the result rather than discarding it (Forge review,
+            # 2026-09-06). `missing_ok=True` turns an unresolvable old entry into a
+            # False return instead of a raise, which is what we want here, but
+            # silently dropping it would report a rename as clean while the old
+            # path is still live. rename_note holds no write lock (see the
+            # concurrency note below), so a concurrent writer really can move this
+            # doc out from under us between the existence check above and here.
+            if not await self._soft_delete_entry_doc(old_path, missing_ok=True):
+                warnings.append(
+                    f"old entry {old_path} could not be soft-deleted, "
+                    f"entry doc not found at tombstone time; old path may still resolve"
+                )
+            else:
+                # Parity with delete_note (Forge review, 2026-09-06): the tombstone
+                # on old_path is the last mutation this function makes and the one
+                # that actually makes the old note disappear, but nothing else here
+                # signals it. The earlier _write_note_raw_put calls each notify
+                # internally, so on a fast rename this is masked by the rate-limit
+                # window still being open, on a rename with many backlinks, or with
+                # none, it is not.
+                await self._notify_livesync()
         else:
             warnings.append(f"old entry {old_path} NOT deleted — backlink warnings present")
 

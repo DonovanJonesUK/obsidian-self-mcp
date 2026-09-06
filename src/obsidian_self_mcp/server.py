@@ -130,7 +130,12 @@ async def append_note(path: str, content: str) -> str:
 
 @mcp.tool()
 async def delete_note(path: str) -> str:
-    """Delete a note and its chunks from the Obsidian vault.
+    """Delete a note from the Obsidian vault (LiveSync soft delete).
+
+    Marks the note deleted the same way the Obsidian client does, the entry
+    document is flagged, its content chunks are left alone. The note disappears
+    from every read path; no other note is affected, even one sharing chunks with
+    it. Writing to the path again restores it. See SAI-OQ-074.
 
     Args:
         path: Vault path to the note to delete

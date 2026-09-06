@@ -119,7 +119,7 @@ Add to your Claude Code settings (`.claude/settings.json` or global):
 | `write_note` | Create or update a note |
 | `search_notes` | Search note content (case-insensitive) |
 | `append_note` | Append content to an existing note |
-| `delete_note` | Delete a note and its chunks |
+| `delete_note` | Soft-delete a note, LiveSync-style (chunks left intact) |
 | `list_folders` | List all folders with note counts |
 | `read_frontmatter` | Read frontmatter properties from a note |
 | `update_frontmatter` | Set/update frontmatter properties (JSON input) |
@@ -185,11 +185,15 @@ obsidian tree                            # alias
 
 ## How LiveSync stores data
 
-LiveSync splits each note into a parent document (metadata + ordered list of chunk IDs) and one or more chunk documents (the actual content). This tool handles all of that transparently — reads reassemble chunks in order, writes create proper chunk documents, and deletes clean up both the parent and all chunks.
+LiveSync splits each note into a parent document (metadata + ordered list of chunk IDs) and one or more chunk documents (the actual content). This tool handles all of that transparently: reads reassemble chunks in order, and writes create proper chunk documents. Deletes never touch chunk documents at all, for the reason set out below.
 
 Document IDs are lowercased vault paths. Paths starting with `_` (like `_Changelog/`) get a `/` prefix since CouchDB reserves `_`-prefixed IDs.
 
-**Rename safety:** LiveSync uses content-addressed chunk IDs, so two notes with identical content share the same chunk documents. A naive rename that deletes the old note with `delete_note` would also delete those shared chunks, silently corrupting any other note that references them. The `rename_note` tool avoids this by soft-deleting only the parent entry document — leaving the chunk documents intact for LiveSync's garbage collector — while atomically updating all wikilink backlinks in other notes before the old path disappears.
+**Chunk-sharing safety:** LiveSync uses content-addressed chunk IDs, so two notes with identical content share the same chunk documents. Nothing in this client may delete a chunk document, because there is no cheap way to know another note does not reference it, measured on one real vault, 9.34% of chunks were multi-referenced and 32.6% of notes shared at least one, the worst chunk with 520 other notes.
+
+`delete_note` therefore performs a LiveSync soft delete: it flags the entry document `deleted: true` and bumps `mtime`, exactly as `deleteDBEntryByPath` in livesync-commonlib does, leaving `children` untouched. The note vanishes from every read path, and writing to the path again restores it. Orphaned chunks are left to LiveSync's garbage collector, they are harmless, whereas a note with its body silently truncated is not. There is no hard-delete or purge verb by design; see SAI-OQ-074.
+
+`rename_note` removes the old *entry* document only, for the same reason, while atomically updating all wikilink backlinks in other notes before the old path disappears.
 
 ## License
 

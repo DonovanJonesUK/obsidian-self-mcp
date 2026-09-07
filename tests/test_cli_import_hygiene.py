@@ -42,22 +42,50 @@ def test_cli_entrypoint_still_imports():
 
 
 def test_block_still_fires_and_httpx_still_imports():
-    """rich and click stay blocked, and httpx imports anyway."""
+    """The saving is real: httpx loaded, httpx._main (and so rich/click) not.
+
+    Asserts the invariant rather than the mechanism. `httpx._main` absent from
+    sys.modules is the thing that makes the CLI faster; the sys.modules
+    sentinels are only how that is achieved, and they are deliberately removed
+    again by cli.py, so asserting on them would test the implementation.
+    """
     code = (
         "import sys\n"
         "import obsidian_self_mcp.cli\n"
-        "assert 'rich' in sys.modules and sys.modules['rich'] is None, "
-        "'rich block missing or overwritten by a real import'\n"
-        "assert 'click' in sys.modules and sys.modules['click'] is None, "
-        "'click block missing or overwritten by a real import'\n"
-        "assert 'httpx' in sys.modules and sys.modules['httpx'] is not None, "
-        "'httpx did not import'\n"
+        "assert sys.modules.get('httpx') is not None, 'httpx did not import'\n"
+        "assert 'httpx._main' not in sys.modules, "
+        "'httpx._main was imported — the block in cli.py is not firing'\n"
+        "assert 'rich' not in sys.modules, 'rich was loaded'\n"
+        "assert 'click' not in sys.modules, 'click was loaded'\n"
         "print('OK')\n"
     )
     result = _run(code)
     assert result.returncode == 0, (
         f"import hygiene assertions failed.\nstdout: {result.stdout}\n"
         f"stderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+def test_block_does_not_leak_into_the_process():
+    """Importing cli.py must leave rich and click importable afterwards.
+
+    sys.modules is process-global. If cli.py left its sentinels behind, any
+    process that imported a helper out of it — including, one refactor from
+    now, the MCP server — would lose rich and click with no error until
+    something needed them.
+    """
+    code = (
+        "import obsidian_self_mcp.cli\n"
+        "import rich, click\n"
+        "assert rich is not None and click is not None\n"
+        "print('OK')\n"
+    )
+    result = _run(code)
+    assert result.returncode == 0, (
+        "rich/click could not be imported after importing cli.py — the block "
+        "leaked into the process.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
 

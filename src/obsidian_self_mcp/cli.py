@@ -4,19 +4,31 @@ import argparse
 import asyncio
 import sys
 
-# Block rich and click before anything imports httpx. httpx/__init__.py does
+# Block rich and click for the duration of the client import only. httpx does
 # `try: from ._main import main / except ImportError: pass`, and httpx._main
-# pulls in rich and click — ~160ms per CLI invocation, for a CLI that is pure
-# argparse and never touches either. Poisoning sys.modules makes that inner
+# pulls in rich and click — dead weight on every invocation of a CLI that is
+# pure argparse and touches neither. Poisoning sys.modules makes that inner
 # import fail fast; httpx's own try/except guard is what makes it safe, so
 # httpx still imports cleanly, just without its unused `main` entrypoint.
-# Deliberately local to cli.py — the MCP server needs real rich and click via
-# typer/uvicorn, so this must never move into client.py or any shared module.
-sys.modules.setdefault("rich", None)
-sys.modules.setdefault("click", None)
+#
+# The sentinels are REMOVED again immediately afterwards. sys.modules is
+# process-global, so leaving them in place would mean that anything importing
+# a helper out of this module — today nothing does, and nothing enforces that —
+# silently loses rich and click for the whole process, including the MCP
+# server, which genuinely needs both via typer and uvicorn. Deleting them
+# restores normal import behaviour while keeping the saving, because httpx
+# only attempts `._main` once, at its own first import.
+_blocked = [m for m in ("rich", "click") if m not in sys.modules]
+for _m in _blocked:
+    sys.modules[_m] = None
 
-from .client import ObsidianVaultClient  # noqa: E402
-from .config import Config  # noqa: E402
+try:
+    from .client import ObsidianVaultClient  # noqa: E402
+    from .config import Config  # noqa: E402
+finally:
+    for _m in _blocked:
+        if sys.modules.get(_m) is None:
+            del sys.modules[_m]
 
 
 def _run(coro):

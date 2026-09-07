@@ -152,7 +152,9 @@ class ObsidianVaultClient:
             self._has_hash_id_probed_at = now
         return self._has_hash_id_docs
 
-    async def _get_doc(self, path: str, *, include_deleted: bool = False) -> dict | None:
+    async def _get_doc(
+        self, path: str, *, include_deleted: bool = False, exhaustive: bool = False
+    ) -> dict | None:
         """Fetch a doc by vault path, trying both ID conventions.
 
         By default, filters out LiveSync-tombstoned documents (`deleted: true`
@@ -161,6 +163,15 @@ class ObsidianVaultClient:
         delete: the doc still returns 200 with its content chunks attached).
         See SAI-OQ-065. Pass include_deleted=True for the rare case a caller
         explicitly wants a tombstone (e.g. auditing what was deleted).
+
+        `exhaustive=True` forces the whole-database path scan on a miss instead
+        of consulting the hash-ID probe. Read callers leave it False and accept
+        a ~16ms probe as the answer. Write, delete and rename callers set it
+        True, because the consequences are asymmetric: a wrong None on a read
+        is a visible, recoverable error, while a wrong None on write_note's
+        existing-doc check silently creates a second document at the same path.
+        Writes are rare, so paying ~3.2s on the miss branch of a write is the
+        correct trade against making a duplicate possible at all.
         """
         client = await self._get_client()
         doc_id = normalize_doc_id(path)
@@ -182,19 +193,26 @@ class ObsidianVaultClient:
 
         # The scan below exists only for the hash-ID (`f:`) doc format, so skip
         # it entirely on databases that have no such docs — it costs ~3.2s
-        # against a 200k-doc database and is called on write paths too.
+        # against a 200k-doc database. Write callers pass exhaustive=True and
+        # never take this shortcut; see the docstring for why.
+        #
         # Residual risk: the gate is specific to the `f:` convention, so a vault
         # using some third, non-path-derivable id convention would regress to a
-        # false None here. No such convention has ever been observed on this
-        # database. Any probe failure falls through to the scan rather than
-        # risking a false None, which on a write path would create a duplicate.
-        try:
-            if not await self._probe_hash_id_docs():
-                return None
-        except Exception as exc:  # noqa: BLE001 - fail safe, never skip the scan
-            logger.warning(
-                "hash-ID doc probe failed (%s); falling back to full path scan", exc
-            )
+        # false None here. A full prefix histogram over all 208,668 ids in the
+        # production database on 2026-09-07 found exactly four id shapes — `h:`
+        # chunks, path-derived ids, `ix:` index docs, and two leading-slash ids
+        # that normalize_doc_id's `_`-prefix rule already resolves — so no such
+        # convention exists here today. Any probe failure falls through to the
+        # scan rather than risking a false None.
+        if not exhaustive:
+            try:
+                if not await self._probe_hash_id_docs():
+                    return None
+            except Exception as exc:  # noqa: BLE001 - fail safe, never skip the scan
+                logger.warning(
+                    "hash-ID doc probe failed (%s); falling back to full path scan",
+                    exc,
+                )
 
         # Fallback: search by path field (for hash-ID format f:... used by newer LiveSync)
         path_lower = path.lower()
@@ -647,7 +665,7 @@ class ObsidianVaultClient:
         # PUT-new"), not the read-path visibility filter SAI-OQ-065 added
         # elsewhere. A tombstoned doc still occupies the _id and still has a
         # _rev that must be reused, or the PUT below 409s against it.
-        existing = await self._get_doc(vault_path, include_deleted=True)
+        existing = await self._get_doc(vault_path, include_deleted=True, exhaustive=True)
 
         if existing:
             # `path` is otherwise create-only: prior to this fix, an update to an
@@ -670,7 +688,7 @@ class ObsidianVaultClient:
             existing_id = encode_doc_id(existing["_id"])
             resp = await client.put(f"/{existing_id}", json=existing)
             if resp.status_code == 409:
-                fresh = await self._get_doc(vault_path, include_deleted=True)
+                fresh = await self._get_doc(vault_path, include_deleted=True, exhaustive=True)
                 if fresh:
                     fresh["children"] = chunk_ids
                     fresh["mtime"] = now_ms
@@ -858,7 +876,7 @@ class ObsidianVaultClient:
         """
         client = await self._get_client()
 
-        doc = await self._get_doc(vault_path, include_deleted=True)
+        doc = await self._get_doc(vault_path, include_deleted=True, exhaustive=True)
         if not doc:
             if missing_ok:
                 return False
@@ -872,7 +890,7 @@ class ObsidianVaultClient:
 
         resp = await client.put(f"/{encode_doc_id(doc['_id'])}", json=_tombstone(doc))
         if resp.status_code == 409:
-            fresh = await self._get_doc(vault_path, include_deleted=True)
+            fresh = await self._get_doc(vault_path, include_deleted=True, exhaustive=True)
             if fresh:
                 resp = await client.put(
                     f"/{encode_doc_id(fresh['_id'])}", json=_tombstone(fresh)
@@ -891,7 +909,7 @@ class ObsidianVaultClient:
         old_path = old_path.lstrip("/")
         new_path = new_path.lstrip("/")
 
-        old_doc = await self._get_doc(old_path)
+        old_doc = await self._get_doc(old_path, exhaustive=True)
         if not old_doc:
             raise ValueError(f"Source note not found: {old_path}")
 
@@ -909,7 +927,7 @@ class ObsidianVaultClient:
         # (feedback_livesync_tombstone_rename_collision). The write below
         # (_write_note_raw_put) looks the doc up again with include_deleted=
         # True to correctly resurrect/overwrite it if it was a tombstone.
-        new_doc = await self._get_doc(new_path)
+        new_doc = await self._get_doc(new_path, exhaustive=True)
         if new_doc and not same_underlying_doc:
             raise ValueError(f"Destination already exists: {new_path}")
 

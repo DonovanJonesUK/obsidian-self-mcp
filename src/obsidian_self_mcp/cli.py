@@ -122,11 +122,18 @@ async def _cmd_list(client: ObsidianVaultClient, args):
     # mistake (an audit trusted this command's bare output as complete,
     # missed 22 real files, created duplicates before an independent
     # CouchDB check caught it). Truncation is now impossible to miss.
+    #
+    # --all needs no separate count call: list_notes_all() IS the complete set,
+    # so len(notes) is the true total by construction and a count_notes() call
+    # would just repeat the identical query. The truncation warning below still
+    # cannot fire wrongly: under --all the two numbers are the same number.
     include_deleted = getattr(args, "include_deleted", False)
-    total = await client.count_notes(folder=args.folder, include_deleted=include_deleted)
-    if getattr(args, "all", False):
+    want_all = getattr(args, "all", False)
+    if want_all:
         notes = await client.list_notes_all(folder=args.folder, include_deleted=include_deleted)
+        total = len(notes)
     else:
+        total = await client.count_notes(folder=args.folder, include_deleted=include_deleted)
         notes = await client.list_notes(folder=args.folder, limit=args.n, include_deleted=include_deleted)
     if not notes:
         print("No notes found.")

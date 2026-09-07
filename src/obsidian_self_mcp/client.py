@@ -336,25 +336,68 @@ class ObsidianVaultClient:
 
         return docs
 
+    async def _get_folder_file_docs(
+        self, folder: str, *, include_deleted: bool = False
+    ) -> list[dict]:
+        """The file docs under one folder, scoped server-side.
+
+        `_id` is the lowercased `path` (normalize_doc_id), so a startkey/endkey
+        range over the lowercased folder prefix selects exactly the set the old
+        client-side `path.lower().startswith(prefix)` filter produced: the same
+        answer, without transferring the vault to find it. Measured live
+        2026-09-07 on obsidian-thin826x1 (209k docs): the whole-vault path cost
+        2.6s and 8.6MB per call, this costs ~0.02s and 52 bytes for an empty
+        folder. That gap is why a ticket count over 15 projects was pushing the
+        Pulse aggregator past its 60s job timeout.
+
+        Chunk safety is structural, not incidental: chunk ids are exactly
+        "h:" + hash, and any `<folder>/` prefix range either sorts wholly below
+        or wholly above "h:", so no chunk can fall inside one. The `type` /
+        `children` guard below is kept anyway, because index and design docs still
+        live in the same key space.
+        """
+        prefix = folder.strip("/").lower() + "/"
+        client = await self._get_client()
+        resp = await client.get(
+            "/_all_docs",
+            params={
+                "include_docs": "true",
+                "startkey": json.dumps(prefix),
+                # ￰ is the conventional CouchDB high sentinel: it sorts
+                # above every character that can appear in a path segment.
+                "endkey": json.dumps(prefix + "￰"),
+            },
+        )
+        resp.raise_for_status()
+        docs = []
+        for row in resp.json().get("rows", []):
+            doc = row.get("doc", {})
+            if doc.get("type") in ("plain", "newnote") and "children" in doc:
+                if include_deleted or not doc.get("deleted"):
+                    docs.append(doc)
+        return docs
+
     # ── Read operations ────────────────────────────────────────────
 
     async def _get_matching_docs(
         self, folder: str | None = None, *, include_deleted: bool = False
     ) -> list[dict]:
         """The complete, unsliced set of file docs matching an optional folder
-        filter. _get_all_file_docs() already fetches everything from CouchDB
-        with no server-side limit — the only truncation in this codebase was
-        list_notes() silently slicing this already-complete list down to
-        `limit` with no signal to the caller. Shared here so list_notes() and
-        count_notes() can never disagree about what "all" means.
+        filter. Neither branch applies a server-side limit. The only
+        truncation in this codebase was list_notes() silently slicing this
+        already-complete list down to `limit` with no signal to the caller.
+        Shared here so list_notes() and count_notes() can never disagree about
+        what "all" means.
+
+        A folder scopes the CouchDB range query itself (see
+        _get_folder_file_docs); only an unscoped call still pulls the vault.
         """
-        all_docs = await self._get_all_file_docs(include_deleted=include_deleted)
         if folder:
-            folder_lower = folder.strip("/").lower() + "/"
-            all_docs = [
-                d for d in all_docs
-                if d.get("path", d.get("_id", "")).lower().startswith(folder_lower)
-            ]
+            all_docs = await self._get_folder_file_docs(
+                folder, include_deleted=include_deleted
+            )
+        else:
+            all_docs = await self._get_all_file_docs(include_deleted=include_deleted)
         all_docs.sort(key=lambda d: d.get("mtime", 0), reverse=True)
         return all_docs
 

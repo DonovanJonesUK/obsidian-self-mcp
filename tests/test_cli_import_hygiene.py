@@ -41,53 +41,35 @@ def test_cli_entrypoint_still_imports():
     )
 
 
-def test_block_still_fires_and_httpx_still_imports():
-    """The saving is real: httpx loaded, httpx._main (and so rich/click) not.
+def test_selftest_command_passes():
+    """`obsidian selftest` is the single implementation of these invariants.
 
-    Asserts the invariant rather than the mechanism. `httpx._main` absent from
-    sys.modules is the thing that makes the CLI faster; the sys.modules
-    sentinels are only how that is achieved, and they are deliberately removed
-    again by cli.py, so asserting on them would test the implementation.
+    The checks used to be duplicated here as inline assertions. They now live in
+    obsidian_self_mcp.cli.run_selftest so that the thing a scheduler runs and the
+    thing this file asserts cannot drift apart, and so the CLI can check its own
+    startup assumption without a test runner installed.
     """
-    code = (
-        "import sys\n"
-        "import obsidian_self_mcp.cli\n"
-        "assert sys.modules.get('httpx') is not None, 'httpx did not import'\n"
-        "assert 'httpx._main' not in sys.modules, "
-        "'httpx._main was imported — the block in cli.py is not firing'\n"
-        "assert 'rich' not in sys.modules, 'rich was loaded'\n"
-        "assert 'click' not in sys.modules, 'click was loaded'\n"
-        "print('OK')\n"
-    )
-    result = _run(code)
+    result = _run("from obsidian_self_mcp.cli import run_selftest; "
+                  "raise SystemExit(run_selftest(quiet=True))")
     assert result.returncode == 0, (
-        f"import hygiene assertions failed.\nstdout: {result.stdout}\n"
-        f"stderr: {result.stderr}"
-    )
-    assert "OK" in result.stdout
-
-
-def test_block_does_not_leak_into_the_process():
-    """Importing cli.py must leave rich and click importable afterwards.
-
-    sys.modules is process-global. If cli.py left its sentinels behind, any
-    process that imported a helper out of it — including, one refactor from
-    now, the MCP server — would lose rich and click with no error until
-    something needed them.
-    """
-    code = (
-        "import obsidian_self_mcp.cli\n"
-        "import rich, click\n"
-        "assert rich is not None and click is not None\n"
-        "print('OK')\n"
-    )
-    result = _run(code)
-    assert result.returncode == 0, (
-        "rich/click could not be imported after importing cli.py — the block "
-        "leaked into the process.\n"
+        "obsidian selftest failed — if httpx has dropped or narrowed its "
+        "try/except guard around httpx._main, the import block in cli.py must "
+        "go.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "OK" in result.stdout
+
+
+def test_selftest_actually_fails_when_the_invariant_breaks():
+    """Manufactured failure: a passing check that cannot fail proves nothing."""
+    result = _run("import httpx._main; "
+                  "from obsidian_self_mcp.cli import run_selftest; "
+                  "raise SystemExit(run_selftest(quiet=True))")
+    assert result.returncode == 1, (
+        "selftest reported success with httpx._main deliberately imported, so "
+        "it is not actually checking anything.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "httpx._main skipped" in result.stderr
 
 
 if __name__ == "__main__":

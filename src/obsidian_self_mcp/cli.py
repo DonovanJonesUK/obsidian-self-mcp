@@ -31,6 +31,79 @@ finally:
             del sys.modules[_m]
 
 
+def run_selftest(quiet: bool = False) -> int:
+    """Check the import-block invariants inside this very process.
+
+    The block above is the only place this CLI depends on undocumented
+    behaviour of a third-party package: httpx catching ImportError around its
+    optional `._main` entrypoint. If a future httpx narrows that clause to
+    ModuleNotFoundError, or drops it, every invocation of this command dies at
+    import time and every tool that shells out to it breaks at once, for a
+    reason nobody would connect to a library upgrade weeks earlier.
+
+    This lives in the CLI rather than in a test file because a test only helps
+    if something runs it, and nothing did. `obsidian selftest` can be run by
+    hand, by a scheduled job, or after any dependency upgrade.
+
+    Returns a process exit code. With quiet=True nothing is printed unless a
+    check fails, so a scheduler can run it unconditionally and hear from it
+    only when there is something to say.
+    """
+    checks: list[tuple[str, bool, str]] = []
+
+    checks.append((
+        "httpx imported",
+        sys.modules.get("httpx") is not None,
+        "httpx is not loaded, so the CLI could not have reached CouchDB anyway",
+    ))
+    checks.append((
+        "httpx._main skipped",
+        "httpx._main" not in sys.modules,
+        "httpx._main was imported, so the block is no longer firing and every "
+        "read is paying for rich and click again",
+    ))
+    for mod in ("rich", "click"):
+        checks.append((
+            f"{mod} not loaded",
+            mod not in sys.modules,
+            f"{mod} was pulled into the process despite the block",
+        ))
+
+    # Must run last: this deliberately imports the two modules, so it would
+    # invalidate the "not loaded" checks above if it ran before them.
+    leak_ok, leak_detail = True, ""
+    try:
+        import click  # noqa: F401
+        import rich  # noqa: F401
+    except ImportError as exc:
+        leak_ok = False
+        leak_detail = (
+            f"rich/click are not importable after startup ({exc}); the block "
+            "leaked into the process and anything else running here has lost them"
+        )
+    checks.append(("no leak into the process", leak_ok, leak_detail))
+
+    failed = [(name, detail) for name, ok, detail in checks if not ok]
+
+    if failed:
+        print("obsidian selftest: FAILED", file=sys.stderr)
+        for name, detail in failed:
+            print(f"  FAIL {name}: {detail}", file=sys.stderr)
+        print(
+            "  The import block lives at the top of obsidian_self_mcp/cli.py. "
+            "If httpx has changed, remove the block and accept the slower "
+            "startup rather than leaving the CLI broken.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not quiet:
+        for name, _ok, _detail in checks:
+            print(f"  ok  {name}")
+        print(f"obsidian selftest: {len(checks)} checks passed")
+    return 0
+
+
 def _run(coro):
     """Run an async coroutine synchronously."""
     return asyncio.run(coro)
@@ -306,7 +379,23 @@ def main():
     # folders / tree
     sub.add_parser("folders", aliases=["tree"], help="List folders")
 
+    # selftest
+    p_selftest = sub.add_parser(
+        "selftest",
+        help="Check this CLI's own startup assumptions (no vault access, no credentials)",
+    )
+    p_selftest.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print nothing unless a check fails — for schedulers",
+    )
+
     args = parser.parse_args()
+
+    # Handled before the client is constructed: selftest needs no credentials
+    # and no CouchDB, and must stay runnable when the vault is unreachable.
+    if args.command == "selftest":
+        raise SystemExit(run_selftest(quiet=args.quiet))
 
     cmd_map = {
         "list": _cmd_list, "ls": _cmd_list,

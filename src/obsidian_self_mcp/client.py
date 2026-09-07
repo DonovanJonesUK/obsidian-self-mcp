@@ -95,11 +95,18 @@ def _replace_wikilink_target(content: str, old_name: str, new_name: str) -> str:
 class ObsidianVaultClient:
     """Async client for reading/writing Obsidian vault docs in CouchDB."""
 
+    #: Seconds a `_probe_hash_id_docs()` result stays cached. Bounds how long a
+    #: long-lived process can keep skipping the path scan after the database
+    #: starts using hash-ID docs. A one-shot CLI run never re-probes.
+    HASH_ID_PROBE_TTL: float = 300.0
+
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
         self._client: httpx.AsyncClient | None = None
         self._last_ntfy_time: float = 0.0
         self._write_locks: dict[str, asyncio.Lock] = {}
+        self._has_hash_id_docs: bool | None = None
+        self._has_hash_id_probed_at: float = 0.0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -116,6 +123,34 @@ class ObsidianVaultClient:
             await self._client.aclose()
 
     # ── Low-level helpers ──────────────────────────────────────────
+
+    async def _probe_hash_id_docs(self) -> bool:
+        """Whether this database contains any LiveSync hash-ID (`f:`) docs.
+
+        One `_all_docs` prefix probe limited to a single row (~16ms). Lets
+        `_get_doc()` skip the ~3.2s whole-database path scan on databases that
+        have never used the hash-ID convention.
+
+        The result is cached for HASH_ID_PROBE_TTL seconds rather than for the
+        life of the instance. A one-shot CLI process probes exactly once either
+        way; the TTL exists for the long-lived MCP server, which would otherwise
+        keep skipping the scan for its whole uptime if hash-ID docs started
+        appearing after its first probe. Re-probing costs 16ms per TTL window.
+        """
+        now = time.monotonic()
+        if (
+            self._has_hash_id_docs is None
+            or now - self._has_hash_id_probed_at >= self.HASH_ID_PROBE_TTL
+        ):
+            client = await self._get_client()
+            resp = await client.get(
+                "/_all_docs",
+                params={"startkey": '"f:"', "endkey": '"f:\ufff0"', "limit": "1"},
+            )
+            resp.raise_for_status()
+            self._has_hash_id_docs = bool(resp.json().get("rows"))
+            self._has_hash_id_probed_at = now
+        return self._has_hash_id_docs
 
     async def _get_doc(self, path: str, *, include_deleted: bool = False) -> dict | None:
         """Fetch a doc by vault path, trying both ID conventions.
@@ -144,6 +179,22 @@ class ObsidianVaultClient:
             doc = resp.json()
             if include_deleted or not doc.get("deleted"):
                 return doc
+
+        # The scan below exists only for the hash-ID (`f:`) doc format, so skip
+        # it entirely on databases that have no such docs — it costs ~3.2s
+        # against a 200k-doc database and is called on write paths too.
+        # Residual risk: the gate is specific to the `f:` convention, so a vault
+        # using some third, non-path-derivable id convention would regress to a
+        # false None here. No such convention has ever been observed on this
+        # database. Any probe failure falls through to the scan rather than
+        # risking a false None, which on a write path would create a duplicate.
+        try:
+            if not await self._probe_hash_id_docs():
+                return None
+        except Exception as exc:  # noqa: BLE001 - fail safe, never skip the scan
+            logger.warning(
+                "hash-ID doc probe failed (%s); falling back to full path scan", exc
+            )
 
         # Fallback: search by path field (for hash-ID format f:... used by newer LiveSync)
         path_lower = path.lower()

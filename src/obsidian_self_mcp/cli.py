@@ -4,8 +4,19 @@ import argparse
 import asyncio
 import sys
 
-from .client import ObsidianVaultClient
-from .config import Config
+# Block rich and click before anything imports httpx. httpx/__init__.py does
+# `try: from ._main import main / except ImportError: pass`, and httpx._main
+# pulls in rich and click — ~160ms per CLI invocation, for a CLI that is pure
+# argparse and never touches either. Poisoning sys.modules makes that inner
+# import fail fast; httpx's own try/except guard is what makes it safe, so
+# httpx still imports cleanly, just without its unused `main` entrypoint.
+# Deliberately local to cli.py — the MCP server needs real rich and click via
+# typer/uvicorn, so this must never move into client.py or any shared module.
+sys.modules.setdefault("rich", None)
+sys.modules.setdefault("click", None)
+
+from .client import ObsidianVaultClient  # noqa: E402
+from .config import Config  # noqa: E402
 
 
 def _run(coro):

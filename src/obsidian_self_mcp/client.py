@@ -13,6 +13,7 @@ import httpx
 
 from .config import Config
 from .models import BacklinkInfo, FolderInfo, NoteContent, NoteMetadata, SearchResult
+from .prose import normalize_prose
 from .utils import (
     encode_doc_id,
     extract_frontmatter,
@@ -766,7 +767,10 @@ class ObsidianVaultClient:
         `write_note()`, or from `append_note()` which holds the lock across
         its own read+write span (see there for why)."""
         canonical_path = await self._canonicalize_path(vault_path)
-        await self._delegate_write(canonical_path, content)
+        # Every text write passes here and only here (write_note's non-binary branch and
+        # append_note), so this is where hard-wrapped prose is rejoined. Binary writes go via
+        # _write_note_raw_put and never reach this. Fails open: see prose.normalize_prose.
+        await self._delegate_write(canonical_path, normalize_prose(content))
         await self._notify_livesync()
         return True
 

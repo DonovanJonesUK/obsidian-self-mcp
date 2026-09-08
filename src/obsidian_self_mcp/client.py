@@ -346,7 +346,7 @@ class ObsidianVaultClient:
         range over the lowercased folder prefix selects exactly the set the old
         client-side `path.lower().startswith(prefix)` filter produced: the same
         answer, without transferring the vault to find it. Measured live
-        2026-09-07 on obsidian-thin826x1 (209k docs): the whole-vault path cost
+        2026-09-07 against a production vault (209k docs): the whole-vault path cost
         2.6s and 8.6MB per call, this costs ~0.02s and 52 bytes for an empty
         folder. That gap is why a ticket count over 15 projects was pushing the
         Pulse aggregator past its 60s job timeout.

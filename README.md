@@ -4,6 +4,25 @@ An MCP server and CLI that gives you direct access to your Obsidian vault throug
 
 No Obsidian app required. Works on headless servers, in CI pipelines, from AI agents, or anywhere you can run Python.
 
+## Differences from upstream
+
+This is a fork of [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), 20 commits ahead and 0 behind, maintained against a production vault since June 2026.
+
+**Eight of those commits fix data-integrity defects inherited from the original release.** If you are running the upstream version or another fork, these are the ones that matter:
+
+- **`delete_note` destroyed chunks belonging to other notes.** Chunk ids are content-addressed, so identical content across notes resolves to one shared chunk. Deleting any note silently truncated every note sharing a chunk with it. On a 13,408-note vault, 32.6% of notes were unsafe to delete. Now a soft delete that leaves `children` untouched. ([upstream issue #3](https://github.com/suhasvemuri/obsidian-self-mcp/issues/3))
+- **Soft-deleted notes were returned as live results**, because LiveSync deletes by a body flag rather than a CouchDB tombstone.
+- **`list_notes` silently truncated at 50** with no signal, which caused a real duplicate-file incident. Now reports true totals, warns on truncation, and adds `count_notes`.
+- **PyYAML wrapped long frontmatter scalars at 80 columns**, which line-based parsers then read as truncated.
+- **Lowercase writes created duplicate vault folders**, because `_id` is lowercased but `path` is stored verbatim.
+- **Case-only renames were impossible**, and a note's stored casing was frozen at creation.
+- **Newer LiveSync `f:` hash-ID documents were not found**, because lookups keyed on `_id` rather than `path`.
+- **`obsidian read` appended a newline the note did not contain**, so any read-then-write round trip grew the file by a byte per cycle.
+
+It also adds `rename_note` with wikilink backlink propagation, a delegated write path using a `livesync-commonlib`-backed writer, opt-in prose normalisation, and substantial startup and query-cost work.
+
+Full detail, including what is deliberately *not* fixed: [FORK-CHANGES.md](FORK-CHANGES.md).
+
 ## How it works
 
 If you use Obsidian LiveSync, your vault is already stored in CouchDB. This tool talks directly to that CouchDB instance — reading, writing, searching, and managing notes using the same document/chunk format that LiveSync uses. Changes sync back to Obsidian automatically.

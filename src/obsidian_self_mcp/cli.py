@@ -166,7 +166,7 @@ async def _cmd_read(client: ObsidianVaultClient, args):
         # and notes conventionally already end with one, so stdout carried one byte the note did
         # not. Reading never mutated anything, but any tool that captured this and wrote it back
         # grew the note by a byte per cycle. Consumers had absorbed that downstream instead
-        # (37 trimEnd() sites in PAI's cstate-oq.ts alone). See VHK-DEC-133.
+        # (two sites in PAI's cstate-oq.ts, at lines 1128 and 1289). See VHK-DEC-133.
         sys.stdout.write(note.content)
 
 

@@ -1,5 +1,8 @@
 """FastMCP server exposing Obsidian vault tools via stdio transport."""
 
+import os
+import resource
+
 from mcp.server.fastmcp import FastMCP
 
 from .client import ObsidianVaultClient
@@ -276,7 +279,38 @@ async def list_folders() -> str:
     return f"Found {len(folders)} folders:\n" + "\n".join(lines)
 
 
+def _apply_memory_cap() -> None:
+    """Cap this process's address space so a runaway query dies alone.
+
+    Claude Code spawns the server as a stdio child of the terminal pane, which on
+    a systemd-managed tmux pane means it shares the pane's scope and the pane's
+    `MemoryMax=infinity`. When the server was OOM-killed on 2026-09-10 systemd's
+    default `OOMPolicy=stop` then failed the whole scope and SIGKILLed the pane's
+    shell, so a single bad query cost the entire Claude session.
+
+    An RLIMIT_AS cap is used rather than a cgroup `MemoryMax` because it is
+    enforced at allocation time: the query raises MemoryError and the tool returns
+    an error, instead of the kernel killing a process that has already grown too
+    big to be killed quietly. A healthy server sits around 211 MB of address
+    space, so the default leaves roughly seven times headroom.
+
+    Set OBSIDIAN_MCP_MEMORY_LIMIT_MB=0 to disable.
+    """
+    try:
+        limit_mb = int(os.environ.get("OBSIDIAN_MCP_MEMORY_LIMIT_MB", "1536"))
+    except ValueError:
+        limit_mb = 1536
+    if limit_mb <= 0:
+        return
+    limit_bytes = limit_mb * 1024 * 1024
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard != resource.RLIM_INFINITY and limit_bytes > hard:
+        limit_bytes = hard
+    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))
+
+
 def main():
+    _apply_memory_cap()
     mcp.run(transport="stdio")
 
 

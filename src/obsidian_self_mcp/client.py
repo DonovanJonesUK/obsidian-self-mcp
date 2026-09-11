@@ -1080,16 +1080,50 @@ class ObsidianVaultClient:
 
     # ── Search ─────────────────────────────────────────────────────
 
+    # Mango's `limit` counts CHUNKS, not notes, and several chunks of the same
+    # note routinely match, so scanning only `limit` chunks would collapse recall.
+    # The caller's note limit therefore buys a chunk budget with headroom, capped
+    # so a broad query cannot scan without bound.
+    CHUNK_BUDGET_PER_NOTE = 25
+    CHUNK_BUDGET_MAX = 5000
+
+    # Snippets quoted per note in the result (unchanged from the original).
+    SNIPPETS_PER_NOTE = 3
+
+    # A chunk longer than this is treated as attachment payload rather than prose.
+    # Vault attachments are stored base64-encoded, so a short query matches inside
+    # them constantly and the surrounding 120 characters are meaningless noise.
+    MAX_SNIPPET_SOURCE_CHARS = 262144
+
     async def search_notes(
         self, query: str, folder: str | None = None, limit: int = 20
     ) -> list[SearchResult]:
-        """Search note content using chunk scanning with reverse map."""
+        """Search note content using chunk scanning with reverse map.
+
+        The Mango query returns chunk IDs only. Asking it for `data` as well made
+        the response proportional to what matched rather than to what was asked
+        for: measured on production 2026-09-10, query "DFS" over 216,185 docs
+        returned a 1.13 GB body, which took the server past the machine's memory
+        and got it OOM-killed. Chunk payloads are now fetched in a second, bounded
+        pass covering only the notes that survive ranking and truncation.
+
+        `folder` cannot be pushed into the Mango selector: the selector matches
+        `type: leaf` chunk documents, and a chunk carries no path. It is applied
+        to the parent file docs before the reverse map is built, which is the
+        earliest point a path is known, so folder-scoped searches never fetch a
+        chunk from outside the folder.
+        """
         client = await self._get_client()
 
-        # Build chunk-to-parent reverse map
+        # Build chunk-to-parent reverse map, folder-filtered up front.
         all_docs = await self._get_all_file_docs()
+        folder_prefix = folder.strip("/").lower() + "/" if folder else None
         chunk_to_parent: dict[str, dict] = {}
         for doc in all_docs:
+            if folder_prefix:
+                doc_path = doc.get("path", doc.get("_id", ""))
+                if not doc_path.lower().startswith(folder_prefix):
+                    continue
             for cid in doc.get("children", []):
                 chunk_to_parent[cid] = doc
 
@@ -1097,38 +1131,57 @@ class ObsidianVaultClient:
         import re
         query_escaped = re.escape(query)
 
+        chunk_budget = min(
+            max(limit, 1) * self.CHUNK_BUDGET_PER_NOTE, self.CHUNK_BUDGET_MAX
+        )
         mango = {
             "selector": {
                 "type": "leaf",
                 "data": {"$regex": f"(?i){query_escaped}"},
             },
-            "fields": ["_id", "data"],
-            "limit": 5000,
+            # IDs only. Never add "data" here — see the docstring.
+            "fields": ["_id"],
+            "limit": chunk_budget,
         }
         resp = await client.post("/_find", json=mango)
         resp.raise_for_status()
-        matching_chunks = resp.json().get("docs", [])
+        matching_ids = [d["_id"] for d in resp.json().get("docs", []) if "_id" in d]
 
-        # Group by parent note
-        note_matches: dict[str, list[str]] = defaultdict(list)
-        for chunk in matching_chunks:
-            chunk_id = chunk["_id"]
+        # Group matching chunk IDs by parent note. Ranking happens on IDs alone,
+        # so no payload is fetched for a note that will be truncated away.
+        note_chunks: dict[str, list[str]] = defaultdict(list)
+        for chunk_id in matching_ids:
             parent = chunk_to_parent.get(chunk_id)
             if not parent:
                 continue
             parent_path = parent.get("path", parent.get("_id", ""))
+            note_chunks[parent_path].append(chunk_id)
 
-            # Filter by folder if specified
-            if folder:
-                folder_lower = folder.strip("/").lower() + "/"
-                if not parent_path.lower().startswith(folder_lower):
+        ranked_paths = sorted(
+            note_chunks, key=lambda p: len(note_chunks[p]), reverse=True
+        )[:limit]
+
+        # One bounded fetch for the payloads actually quoted: at most
+        # limit * SNIPPETS_PER_NOTE chunks.
+        snippet_ids = [
+            cid
+            for path in ranked_paths
+            for cid in note_chunks[path][: self.SNIPPETS_PER_NOTE]
+        ]
+        chunk_data = await self._fetch_chunks(snippet_ids)
+
+        pattern = re.compile(query_escaped, re.IGNORECASE)
+        results = []
+        for path in ranked_paths:
+            snippets = []
+            for cid in note_chunks[path][: self.SNIPPETS_PER_NOTE]:
+                data = chunk_data.get(cid, "")
+                if len(data) > self.MAX_SNIPPET_SOURCE_CHARS:
+                    snippets.append("[match inside an attachment chunk, not quoted]")
                     continue
-
-            # Extract snippet
-            data = chunk.get("data", "")
-            pattern = re.compile(re.escape(query), re.IGNORECASE)
-            match = pattern.search(data)
-            if match:
+                match = pattern.search(data)
+                if not match:
+                    continue
                 start = max(0, match.start() - 60)
                 end = min(len(data), match.end() + 60)
                 snippet = data[start:end].replace("\n", " ").strip()
@@ -1136,18 +1189,14 @@ class ObsidianVaultClient:
                     snippet = "..." + snippet
                 if end < len(data):
                     snippet = snippet + "..."
-                note_matches[parent_path].append(snippet)
-
-        # Build results sorted by match count
-        results = []
-        for path, snippets in note_matches.items():
+                snippets.append(snippet)
             results.append(SearchResult(
                 path=path,
-                matches=len(snippets),
-                snippets=snippets[:3],  # Cap at 3 snippets per note
+                # Chunks matched, not occurrences — unchanged semantics.
+                matches=len(note_chunks[path]),
+                snippets=snippets,
             ))
-        results.sort(key=lambda r: r.matches, reverse=True)
-        return results[:limit]
+        return results
 
     # ── Frontmatter operations ─────────────────────────────────────
 

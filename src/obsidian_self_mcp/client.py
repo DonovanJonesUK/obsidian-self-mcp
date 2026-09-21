@@ -1455,23 +1455,26 @@ class ObsidianVaultClient:
             for d in changed if d["_id"] in failed_ids
         ]
 
-        # Hits are re-read, in one batched fetch, only for the context snippet.
-        # A hit whose chunk went missing since caching gets an empty snippet
-        # here; rename_note's strict read of that note is what catches it.
-        chunks = await self._fetch_chunks_batched(
-            list(dict.fromkeys(cid for d in hits for cid in d["children"]))
-        )
+        # Hits are re-read, in batched fetches grouped like the scan so a hub
+        # note's hits cannot lift peak memory past the group bound, only for the
+        # context snippet. A hit whose chunk went missing since caching gets an
+        # empty snippet here; rename_note's strict read of that note catches it.
         pattern = re.compile(
             r"(?:^|\n)([^\n]*\[\[" + re.escape(target_name) + r"[^\]]*\]\][^\n]*)",
             re.IGNORECASE,
         )
         results = []
-        for d in hits:
-            ctx = ""
-            if all(cid in chunks for cid in d["children"]):
-                m = pattern.search("".join(chunks[cid] for cid in d["children"]))
-                ctx = m.group(1).strip() if m else ""
-            results.append(BacklinkInfo(source_path=doc_path(d), context=ctx))
+        for g in range(0, len(hits), BACKLINK_NOTE_GROUP):
+            group = hits[g : g + BACKLINK_NOTE_GROUP]
+            chunks = await self._fetch_chunks_batched(
+                list(dict.fromkeys(cid for d in group for cid in d["children"]))
+            )
+            for d in group:
+                ctx = ""
+                if all(cid in chunks for cid in d["children"]):
+                    m = pattern.search("".join(chunks[cid] for cid in d["children"]))
+                    ctx = m.group(1).strip() if m else ""
+                results.append(BacklinkInfo(source_path=doc_path(d), context=ctx))
 
         return results, failures
 

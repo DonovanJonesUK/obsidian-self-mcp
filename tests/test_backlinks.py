@@ -146,6 +146,22 @@ def test_transport_failure_raises_and_leaves_cache_untouched():
     assert v._link_cache == {}
 
 
+def test_transport_failure_on_warm_cache_raises_and_keeps_entries_intact():
+    v = _vault()
+    run(v.get_backlinks_report("Target.md"))
+    before = dict(v._link_cache)
+    # A changed note forces a rescan, and that rescan's fetch fails.
+    v.docs[3] = _doc("Unrelated.md", ["h:u2"], rev="2-b")
+    v.chunks["h:u2"] = "now links [[Target]]"
+    v.fail_fetch = True
+    with pytest.raises(httpx.ConnectError):
+        run(v.get_backlinks_report("Target.md"))
+    assert v._link_cache == before  # no half-written entry for Unrelated.md
+    v.fail_fetch = False
+    hits, _ = run(v.get_backlinks_report("Target.md"))
+    assert "Unrelated.md" in [h.source_path for h in hits]
+
+
 def test_uninterpretable_listing_raises_instead_of_reporting_no_backlinks():
     # e.g. LiveSync path obfuscation: every path is ciphertext.
     v = FakeVault([_doc("9f8e7d6c5b4a", ["h:x"])], {"h:x": "[[Target]]"})

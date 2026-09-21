@@ -32,6 +32,19 @@ BINARY_EXTENSIONS = {
     ".mp3", ".mp4", ".wav", ".zip", ".tar", ".gz",
 }
 
+# File types Obsidian resolves wikilinks in. The backlink scan reads nothing
+# else: on production 2026-09-21, 28 .js files were 53.6 MB of the ~104 MB a
+# full scan pulled, and none of it can hold a link Obsidian would follow.
+LINK_BEARING_EXTENSIONS = (".md", ".canvas", ".base")
+
+# Backlink scan batching. Notes are processed in groups so chunk text never
+# outlives its group (peak memory bounded by group size, not vault size); each
+# group's chunks are fetched in keyed POSTs at bounded concurrency. Measured on
+# production 2026-09-21: concurrency beyond 8 gave nothing on the 4-core VPS.
+BACKLINK_NOTE_GROUP = 1000
+BACKLINK_CHUNK_BATCH = 500
+BACKLINK_CONCURRENCY = 8
+
 # node_writer/ is the real livesync-commonlib-backed writer (via a vendored
 # fanselau/obsidian-vault-cli submodule) that write_note()/append_note() delegate
 # plain-text writes to, instead of this module's own generate_chunk_id()+raw-PUT
@@ -108,6 +121,11 @@ class ObsidianVaultClient:
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._has_hash_id_docs: bool | None = None
         self._has_hash_id_probed_at: float = 0.0
+        # doc _id -> (children at scan time, lowercased link basenames).
+        # Chunk ids are content-addressed, so an unchanged `children` list
+        # means unchanged content and the cached links still hold.
+        self._link_cache: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {}
+        self._link_cache_lock = asyncio.Lock()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -1297,8 +1315,53 @@ class ObsidianVaultClient:
             return []
         return extract_wikilinks(note.content)
 
+    async def _scan_link_targets(
+        self, docs: list[dict]
+    ) -> tuple[dict[str, frozenset[str]], set[str]]:
+        """Extract lowercased wikilink basenames for each doc, in bounded batches.
+
+        Returns ({doc _id: link names}, {ids with a chunk missing from CouchDB}).
+        A partial doc's links come from whatever chunks exist, matching what a
+        single-note read reassembles, but the caller must not cache them.
+        """
+        sem = asyncio.Semaphore(BACKLINK_CONCURRENCY)
+        names: dict[str, frozenset[str]] = {}
+        partial: set[str] = set()
+
+        async def fetch(ids: list[str], into: dict[str, str]) -> None:
+            async with sem:
+                into.update(await self._fetch_chunks(ids))
+
+        for g in range(0, len(docs), BACKLINK_NOTE_GROUP):
+            group = docs[g : g + BACKLINK_NOTE_GROUP]
+            ids = list(dict.fromkeys(cid for d in group for cid in d["children"]))
+            chunks: dict[str, str] = {}
+            await asyncio.gather(*(
+                fetch(ids[i : i + BACKLINK_CHUNK_BATCH], chunks)
+                for i in range(0, len(ids), BACKLINK_CHUNK_BATCH)
+            ))
+            for d in group:
+                content = "".join(chunks.get(cid, "") for cid in d["children"])
+                names[d["_id"]] = frozenset(
+                    l.rsplit("/", 1)[-1].lower() for l in extract_wikilinks(content)
+                )
+                if any(cid not in chunks for cid in d["children"]):
+                    logger.warning(
+                        "get_backlinks: %s has missing chunk(s); links read from "
+                        "the partial content and not cached",
+                        d.get("path", d["_id"]),
+                    )
+                    partial.add(d["_id"])
+        return names, partial
+
     async def get_backlinks(self, path: str) -> list[BacklinkInfo]:
-        """Find all notes that contain a wikilink pointing to the given path."""
+        """Find all notes that contain a wikilink pointing to the given path.
+
+        Scans only link-bearing file types (LINK_BEARING_EXTENSIONS). Link
+        targets per note are cached for the life of the client, keyed on the
+        note's `children`; only new or changed notes are re-read, so the first
+        call is a full scan and later ones cost roughly one vault listing.
+        """
         import re
 
         # Normalize target: strip folder prefix and extension for matching
@@ -1307,28 +1370,44 @@ class ObsidianVaultClient:
             target_name = target_name[:-3]
         target_lower = target_name.lower()
 
-        all_docs = await self._get_all_file_docs()
+        all_docs = [
+            d for d in await self._get_all_file_docs()
+            if d.get("type") != "newnote"
+            and d.get("children")
+            and d.get("path", d.get("_id", "")).lower().endswith(LINK_BEARING_EXTENSIONS)
+        ]
+
+        async with self._link_cache_lock:
+            cache = self._link_cache
+            for gone in cache.keys() - {d["_id"] for d in all_docs}:
+                del cache[gone]
+            changed = [
+                d for d in all_docs
+                if d["_id"] not in cache or cache[d["_id"]][0] != tuple(d["children"])
+            ]
+            names, partial = await self._scan_link_targets(changed)
+            for d in changed:
+                if d["_id"] in partial:
+                    cache.pop(d["_id"], None)
+                else:
+                    cache[d["_id"]] = (tuple(d["children"]), names[d["_id"]])
+            links_by_id = {i: v[1] for i, v in cache.items()}
+        links_by_id.update(names)
+
+        pattern = re.compile(
+            r"(?:^|\n)([^\n]*\[\[" + re.escape(target_name) + r"[^\]]*\]\][^\n]*)",
+            re.IGNORECASE,
+        )
         results = []
-
         for doc in all_docs:
-            doc_path = doc.get("path", doc.get("_id", ""))
-            if doc.get("type") == "newnote":
+            if target_lower not in links_by_id.get(doc["_id"], ()):
                 continue
-            content = await self._read_note_content(doc)
-            if not content:
-                continue
-
-            links = extract_wikilinks(content)
-            link_names_lower = [l.rsplit("/", 1)[-1].lower() for l in links]
-
-            if target_lower in link_names_lower:
-                # Extract context snippet around the link
-                pattern = re.compile(
-                    r"(?:^|\n)([^\n]*\[\[" + re.escape(target_name) + r"[^\]]*\]\][^\n]*)",
-                    re.IGNORECASE,
-                )
-                m = pattern.search(content)
-                ctx = m.group(1).strip() if m else ""
-                results.append(BacklinkInfo(source_path=doc_path, context=ctx))
+            # Only hits are re-read, for the context snippet.
+            content = await self._read_note_content(doc) or ""
+            m = pattern.search(content)
+            ctx = m.group(1).strip() if m else ""
+            results.append(
+                BacklinkInfo(source_path=doc.get("path", doc.get("_id", "")), context=ctx)
+            )
 
         return results

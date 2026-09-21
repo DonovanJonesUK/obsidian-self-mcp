@@ -63,6 +63,17 @@ class BacklinkInfo:
 
 
 @dataclass
+class BacklinkFailure:
+    """A link-bearing note the backlink scan could not read, so cannot rule out."""
+
+    source_path: str
+    reason: str  # for a human reading a log; no caller may parse it
+
+    def to_dict(self) -> dict:
+        return {"source_path": self.source_path, "reason": self.reason}
+
+
+@dataclass
 class FolderInfo:
     path: str
     note_count: int

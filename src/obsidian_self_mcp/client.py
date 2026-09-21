@@ -12,7 +12,7 @@ from collections import defaultdict
 import httpx
 
 from .config import Config
-from .models import BacklinkInfo, FolderInfo, NoteContent, NoteMetadata, SearchResult
+from .models import BacklinkFailure, BacklinkInfo, FolderInfo, NoteContent, NoteMetadata, SearchResult
 from .prose import normalize_prose
 from .utils import (
     encode_doc_id,
@@ -121,10 +121,14 @@ class ObsidianVaultClient:
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._has_hash_id_docs: bool | None = None
         self._has_hash_id_probed_at: float = 0.0
-        # doc _id -> (children at scan time, lowercased link basenames).
-        # Chunk ids are content-addressed, so an unchanged `children` list
-        # means unchanged content and the cached links still hold.
-        self._link_cache: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {}
+        # doc _id -> ((children, _rev) at scan time, lowercased link basenames).
+        # No writer reuses a chunk id for different content (LiveSync: content
+        # hash; this module's raw PUT: a fresh random id per write), so an
+        # unchanged `children` list means unchanged content. `_rev` is belt and
+        # braces against a future writer that breaks that.
+        self._link_cache: dict[
+            str, tuple[tuple[tuple[str, ...], str | None], frozenset[str]]
+        ] = {}
         self._link_cache_lock = asyncio.Lock()
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -1003,11 +1007,14 @@ class ObsidianVaultClient:
         if new_name.endswith(".md"):
             new_name = new_name[:-3]
 
-        old_note = await self.read_note(old_path)
+        # strict=True: this content is written to new_path, and a non-strict
+        # read would carry a missing chunk across as a permanent gap. Raises
+        # before any mutation.
+        old_note = await self.read_note(old_path, strict=True)
         if not old_note:
             raise ValueError(f"Could not read source note: {old_path}")
 
-        backlinks = await self.get_backlinks(old_path)
+        backlinks, scan_failures = await self.get_backlinks_report(old_path)
 
         # Write new file first — if this fails, no state has been mutated.
         # Also apply wikilink replacement to the content itself (handles self-links).
@@ -1021,14 +1028,22 @@ class ObsidianVaultClient:
 
         # Update backlink sources now that new_path exists.
         updated = 0
-        warnings: list[str] = []
+        # A note the scan could not read may hold a link to old_path, so it is
+        # a warning like any other: warnings block the old-path tombstone below.
+        warnings: list[str] = [
+            f"could not scan {f.source_path} ({f.reason}); it may still link to {old_name}"
+            for f in scan_failures
+        ]
         for bl in backlinks:
             if bl.source_path == old_path:
                 # Self-link already handled by writing updated body above.
                 updated += 1
                 continue
             try:
-                note = await self.read_note(bl.source_path)
+                # strict=True: this content is written back, and a non-strict
+                # read reassembles a missing chunk as a permanent gap. The
+                # ValueError becomes a warning via the except below.
+                note = await self.read_note(bl.source_path, strict=True)
                 if not note or note.is_binary:
                     warnings.append(f"skipped {bl.source_path} (unreadable or binary)")
                     continue
@@ -1315,52 +1330,80 @@ class ObsidianVaultClient:
             return []
         return extract_wikilinks(note.content)
 
-    async def _scan_link_targets(
-        self, docs: list[dict]
-    ) -> tuple[dict[str, frozenset[str]], set[str]]:
-        """Extract lowercased wikilink basenames for each doc, in bounded batches.
+    async def _fetch_chunks_batched(self, chunk_ids: list[str]) -> dict[str, str]:
+        """Fetch chunks in keyed POSTs of BACKLINK_CHUNK_BATCH at bounded concurrency.
 
-        Returns ({doc _id: link names}, {ids with a chunk missing from CouchDB}).
-        A partial doc's links come from whatever chunks exist, matching what a
-        single-note read reassembles, but the caller must not cache them.
+        A transport failure in any batch cancels the rest and propagates: a
+        reader that cannot reach CouchDB must fail, never answer "nothing found"
+        (SAI-DEC-232). Chunks CouchDB reports missing are simply absent from the
+        result; callers decide what a missing chunk means for their note.
         """
         sem = asyncio.Semaphore(BACKLINK_CONCURRENCY)
-        names: dict[str, frozenset[str]] = {}
-        partial: set[str] = set()
+        out: dict[str, str] = {}
 
-        async def fetch(ids: list[str], into: dict[str, str]) -> None:
+        async def one(ids: list[str]) -> None:
             async with sem:
-                into.update(await self._fetch_chunks(ids))
+                out.update(await self._fetch_chunks(ids))
 
+        tasks = [
+            asyncio.ensure_future(one(chunk_ids[i : i + BACKLINK_CHUNK_BATCH]))
+            for i in range(0, len(chunk_ids), BACKLINK_CHUNK_BATCH)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return out
+
+    async def _scan_link_targets(
+        self, docs: list[dict]
+    ) -> tuple[dict[str, frozenset[str]], dict[str, str]]:
+        """Extract lowercased wikilink basenames for each doc, in bounded groups.
+
+        Returns ({doc _id: link names} for readable docs, {doc _id: reason} for
+        docs with a chunk missing from CouchDB). Every doc lands in exactly one.
+        A doc with a missing chunk is `failed`, not read from the chunks that
+        exist: a gap reassembled as empty text is a plausible wrong answer, not
+        a caught error (SAI-OQ-131, same rule as PAI's vault-batch.ts).
+        """
+        names: dict[str, frozenset[str]] = {}
+        failed: dict[str, str] = {}
         for g in range(0, len(docs), BACKLINK_NOTE_GROUP):
             group = docs[g : g + BACKLINK_NOTE_GROUP]
-            ids = list(dict.fromkeys(cid for d in group for cid in d["children"]))
-            chunks: dict[str, str] = {}
-            await asyncio.gather(*(
-                fetch(ids[i : i + BACKLINK_CHUNK_BATCH], chunks)
-                for i in range(0, len(ids), BACKLINK_CHUNK_BATCH)
-            ))
+            chunks = await self._fetch_chunks_batched(
+                list(dict.fromkeys(cid for d in group for cid in d["children"]))
+            )
             for d in group:
-                content = "".join(chunks.get(cid, "") for cid in d["children"])
+                missing = sum(cid not in chunks for cid in d["children"])
+                if missing:
+                    failed[d["_id"]] = (
+                        f"{missing} of {len(d['children'])} chunks missing from CouchDB"
+                    )
+                    continue
+                content = "".join(chunks[cid] for cid in d["children"])
                 names[d["_id"]] = frozenset(
                     l.rsplit("/", 1)[-1].lower() for l in extract_wikilinks(content)
                 )
-                if any(cid not in chunks for cid in d["children"]):
-                    logger.warning(
-                        "get_backlinks: %s has missing chunk(s); links read from "
-                        "the partial content and not cached",
-                        d.get("path", d["_id"]),
-                    )
-                    partial.add(d["_id"])
-        return names, partial
+        return names, failed
 
-    async def get_backlinks(self, path: str) -> list[BacklinkInfo]:
-        """Find all notes that contain a wikilink pointing to the given path.
+    async def get_backlinks_report(
+        self, path: str
+    ) -> tuple[list[BacklinkInfo], list[BacklinkFailure]]:
+        """Find notes linking to `path`, plus every note that could not be read.
+
+        The two lists together account for every link-bearing note in the vault:
+        a note is either scanned (and a hit or not) or reported as a failure.
+        Nothing is silently left out, so a caller can tell "no link" from
+        "could not look" (SAI-DEC-202). Transport errors raise.
 
         Scans only link-bearing file types (LINK_BEARING_EXTENSIONS). Link
         targets per note are cached for the life of the client, keyed on the
-        note's `children`; only new or changed notes are re-read, so the first
-        call is a full scan and later ones cost roughly one vault listing.
+        note's `children` and `_rev`; only new or changed notes are re-read, so
+        the first call is a full scan and later ones cost roughly one listing.
+        Failed notes are never cached, so they are re-read on every call.
         """
         import re
 
@@ -1370,44 +1413,71 @@ class ObsidianVaultClient:
             target_name = target_name[:-3]
         target_lower = target_name.lower()
 
-        all_docs = [
+        file_docs = [
             d for d in await self._get_all_file_docs()
-            if d.get("type") != "newnote"
-            and d.get("children")
-            and d.get("path", d.get("_id", "")).lower().endswith(LINK_BEARING_EXTENSIONS)
+            if d.get("type") != "newnote" and d.get("children")
         ]
+        all_docs = [
+            d for d in file_docs
+            if d.get("path", d.get("_id", "")).lower().endswith(LINK_BEARING_EXTENSIONS)
+        ]
+        # A vault with text files but no link-bearing ones is not an empty
+        # result, it is a listing we cannot interpret (e.g. LiveSync path
+        # obfuscation turning every `path` into ciphertext). Returning [] here
+        # would let rename_note report a clean rename and break every link.
+        if file_docs and not all_docs:
+            raise RuntimeError(
+                f"get_backlinks: {len(file_docs)} text documents listed but none has a "
+                f"{'/'.join(LINK_BEARING_EXTENSIONS)} path; refusing to report no backlinks"
+            )
 
         async with self._link_cache_lock:
             cache = self._link_cache
             for gone in cache.keys() - {d["_id"] for d in all_docs}:
                 del cache[gone]
+            key = lambda d: (tuple(d["children"]), d.get("_rev"))  # noqa: E731
             changed = [
                 d for d in all_docs
-                if d["_id"] not in cache or cache[d["_id"]][0] != tuple(d["children"])
+                if d["_id"] not in cache or cache[d["_id"]][0] != key(d)
             ]
-            names, partial = await self._scan_link_targets(changed)
+            names, failed_ids = await self._scan_link_targets(changed)
             for d in changed:
-                if d["_id"] in partial:
+                if d["_id"] in failed_ids:
                     cache.pop(d["_id"], None)
                 else:
-                    cache[d["_id"]] = (tuple(d["children"]), names[d["_id"]])
+                    cache[d["_id"]] = (key(d), names[d["_id"]])
             links_by_id = {i: v[1] for i, v in cache.items()}
-        links_by_id.update(names)
 
+        doc_path = lambda d: d.get("path", d.get("_id", ""))  # noqa: E731
+        hits = [d for d in all_docs if target_lower in links_by_id.get(d["_id"], ())]
+        failures = [
+            BacklinkFailure(source_path=doc_path(d), reason=failed_ids[d["_id"]])
+            for d in changed if d["_id"] in failed_ids
+        ]
+
+        # Hits are re-read, in one batched fetch, only for the context snippet.
+        # A hit whose chunk went missing since caching gets an empty snippet
+        # here; rename_note's strict read of that note is what catches it.
+        chunks = await self._fetch_chunks_batched(
+            list(dict.fromkeys(cid for d in hits for cid in d["children"]))
+        )
         pattern = re.compile(
             r"(?:^|\n)([^\n]*\[\[" + re.escape(target_name) + r"[^\]]*\]\][^\n]*)",
             re.IGNORECASE,
         )
         results = []
-        for doc in all_docs:
-            if target_lower not in links_by_id.get(doc["_id"], ()):
-                continue
-            # Only hits are re-read, for the context snippet.
-            content = await self._read_note_content(doc) or ""
-            m = pattern.search(content)
-            ctx = m.group(1).strip() if m else ""
-            results.append(
-                BacklinkInfo(source_path=doc.get("path", doc.get("_id", "")), context=ctx)
-            )
+        for d in hits:
+            ctx = ""
+            if all(cid in chunks for cid in d["children"]):
+                m = pattern.search("".join(chunks[cid] for cid in d["children"]))
+                ctx = m.group(1).strip() if m else ""
+            results.append(BacklinkInfo(source_path=doc_path(d), context=ctx))
 
+        return results, failures
+
+    async def get_backlinks(self, path: str) -> list[BacklinkInfo]:
+        """Notes linking to `path`. Use get_backlinks_report to also see unreadable notes."""
+        results, failures = await self.get_backlinks_report(path)
+        for f in failures:
+            logger.warning("get_backlinks: could not read %s: %s", f.source_path, f.reason)
         return results

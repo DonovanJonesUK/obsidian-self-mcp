@@ -267,16 +267,20 @@ async def _cmd_tags(client: ObsidianVaultClient, args):
 
 
 async def _cmd_backlinks(client: ObsidianVaultClient, args):
-    backlinks = await client.get_backlinks(args.path)
+    backlinks, failures = await client.get_backlinks_report(args.path)
     if not backlinks:
         print(f"No backlinks for: {args.path}")
-        return
     for bl in backlinks:
         ctx = f"  > {bl.context}" if bl.context else ""
         print(f"  {bl.source_path}")
         if ctx:
             print(ctx)
-    print(f"\n{len(backlinks)} backlinks")
+    if backlinks:
+        print(f"\n{len(backlinks)} backlinks")
+    if failures:
+        print(f"\nCould not read {len(failures)} note(s), which may also link here:")
+        for f in failures:
+            print(f"  {f.source_path} ({f.reason})")
 
 
 async def _cmd_links(client: ObsidianVaultClient, args):

@@ -243,14 +243,22 @@ async def get_backlinks(path: str) -> str:
         path: Vault path to the target note
     """
     client = _get_client()
-    backlinks = await client.get_backlinks(path)
+    backlinks, failures = await client.get_backlinks_report(path)
+    # Unreadable notes are reported, never dropped: "no backlinks" must not be
+    # said when some notes could not be checked.
+    unread = ""
+    if failures:
+        unread = (
+            f"\n\nCould not read {len(failures)} note(s), which may also link here:\n"
+            + "\n".join(f"  {f.source_path} ({f.reason})" for f in failures)
+        )
     if not backlinks:
-        return f"No backlinks found for: {path}"
+        return f"No backlinks found for: {path}{unread}"
     lines = []
     for bl in backlinks:
         ctx = f" — {bl.context}" if bl.context else ""
         lines.append(f"  {bl.source_path}{ctx}")
-    return f"Found {len(backlinks)} backlinks for {path}:\n" + "\n".join(lines)
+    return f"Found {len(backlinks)} backlinks for {path}:\n" + "\n".join(lines) + unread
 
 
 @mcp.tool()

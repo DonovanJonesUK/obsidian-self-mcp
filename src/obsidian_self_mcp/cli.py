@@ -23,7 +23,7 @@ for _m in _blocked:
     sys.modules[_m] = None
 
 try:
-    from .client import ObsidianVaultClient  # noqa: E402
+    from .client import ObsidianVaultClient, SearchTimeoutError  # noqa: E402
     from .config import Config  # noqa: E402
 finally:
     for _m in _blocked:
@@ -183,9 +183,13 @@ async def _cmd_write(client: ObsidianVaultClient, args):
 
 
 async def _cmd_search(client: ObsidianVaultClient, args):
-    results = await client.search_notes(
-        query=args.query, folder=args.d, limit=args.n
-    )
+    try:
+        results = await client.search_notes(
+            query=args.query, folder=args.d, limit=args.n
+        )
+    except SearchTimeoutError as e:
+        print(f"Search failed: {e}", file=sys.stderr)
+        sys.exit(1)
     if not results:
         print(f"No results for: {args.query}")
         return

@@ -82,6 +82,16 @@ class NodeWriterError(RuntimeError):
     """
 
 
+class SearchTimeoutError(RuntimeError):
+    """Raised when the `search_notes` Mango scan exceeds SEARCH_FIND_TIMEOUT.
+
+    httpx timeouts stringify to "", and FastMCP reports a tool failure as
+    `Error executing tool search_notes: <str(exc)>`, so an unwrapped timeout
+    reached callers as a blank error. This carries the elapsed time and what to
+    do instead, and chains the httpx exception as its cause.
+    """
+
+
 def _replace_wikilink_target(content: str, old_name: str, new_name: str) -> str:
     """Replace [[OldName...]] wikilinks with [[NewName...]], case-insensitive on filename.
 
@@ -1119,8 +1129,6 @@ class ObsidianVaultClient:
     # so a broad query cannot scan without bound.
     CHUNK_BUDGET_PER_NOTE = 25
     CHUNK_BUDGET_MAX = 5000
-    # The /_find scan is un-indexed and grows with the vault; the client's 30 s default no longer covers it.
-    SEARCH_SCAN_TIMEOUT_SECONDS = 180.0
 
     # Snippets quoted per note in the result (unchanged from the original).
     SNIPPETS_PER_NOTE = 3
@@ -1129,6 +1137,12 @@ class ObsidianVaultClient:
     # Vault attachments are stored base64-encoded, so a short query matches inside
     # them constantly and the surrounding 120 characters are meaningless noise.
     MAX_SNIPPET_SOURCE_CHARS = 262144
+
+    # Per-request timeout for the Mango `_find` scan only. The regex is
+    # un-indexed, so a rare term costs a full pass over every chunk: 42-46s on
+    # production by late 2026-09, past the shared client's 30s. Every other
+    # request keeps the 30s default, so a stalled CouchDB still fails fast there.
+    SEARCH_FIND_TIMEOUT = 120.0
 
     async def search_notes(
         self, query: str, folder: str | None = None, limit: int = 20
@@ -1178,9 +1192,20 @@ class ObsidianVaultClient:
             "fields": ["_id"],
             "limit": chunk_budget,
         }
-        resp = await client.post(
-            "/_find", json=mango, timeout=self.SEARCH_SCAN_TIMEOUT_SECONDS
-        )
+        started = time.monotonic()
+        try:
+            resp = await client.post(
+                "/_find", json=mango, timeout=self.SEARCH_FIND_TIMEOUT
+            )
+        except httpx.TimeoutException as exc:
+            elapsed = time.monotonic() - started
+            raise SearchTimeoutError(
+                f"search_notes timed out after {elapsed:.1f}s: the whole-vault chunk "
+                f"scan for {query!r} did not finish (limit {self.SEARCH_FIND_TIMEOUT:.0f}s). "
+                "Options: use a longer or more distinctive phrase; pass a `folder` "
+                "with a higher `limit` (the result is then a floor, not a count); or, "
+                "for Simon's own writing, use the _VAULTSEARCH skill."
+            ) from exc
         resp.raise_for_status()
         matching_ids = [d["_id"] for d in resp.json().get("docs", []) if "_id" in d]
 

@@ -1,0 +1,30 @@
+# Keeps the search_notes SQLite index current from CouchDB's _changes feed.
+# One instance per database, named by it: obsidian-search-index@obsidiandb-dev.
+# Install: copy to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now obsidian-search-index@<db>.service
+# Enabled into default.target with linger on, so it starts at boot.
+# If it stops, search_notes falls back to the live scan and says so (SAI-DEC-240).
+
+[Unit]
+Description=search_notes index follower for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/rwf-webhook.env
+# The instance name picks the database; OBSIDIAN_COUCH_DB wins over COUCHDB_DB.
+Environment=OBSIDIAN_COUCH_DB=%i
+Environment=PYTHONPATH=%h/obsidian-self-mcp-wt/search-index/src
+WorkingDirectory=%h/obsidian-self-mcp-wt/search-index
+ExecStartPre=%h/obsidian-self-mcp/.venv/bin/python scripts/wait_for_couchdb.py 180
+ExecStart=%h/obsidian-self-mcp/.venv/bin/python -m obsidian_self_mcp.search_index follow
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

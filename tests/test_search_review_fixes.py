@@ -390,3 +390,102 @@ def test_index_for_another_server_is_not_used(tmp_path):
 def test_couch_origin_drops_credentials_and_path():
     assert si.couch_origin("http://user:secret@host:5984/db") == "http://host:5984"
     assert "secret" not in si.couch_origin("https://u:secret@h")
+
+
+# Second review (2026-10-01, range 1906c4f..9bf7d14).
+
+@pytest.mark.parametrize("data", [None, 5, ["x"], {"a": 1}])
+def test_chunk_data_that_is_not_text_fails_the_note_not_the_build(tmp_path, data):
+    couch = _seeded()
+    couch.docs["h:bad"] = {"_id": "h:bad", "_rev": "1-c", "type": "leaf", "data": data}
+    couch.put_note("Bad.md", ["h:bad"])
+    out = _built(tmp_path, couch)
+    status, reason, _ = _row(out, "bad.md")
+    assert status == "failed" and "malformed chunk" in reason
+    assert _row(out, "a.md")[0] == "ok"
+
+
+def test_chunk_data_that_is_not_text_does_not_crash_a_cycle(out_and_couch):
+    out, couch = out_and_couch
+    couch.docs["h:bad"] = {"_id": "h:bad", "_rev": "1-c", "type": "leaf", "data": None}
+    couch.log.append((couch.seq() + 1, "h:bad", False))
+    couch.put_note("Bad.md", ["h:bad"])
+    _cycle(out, couch)
+    assert _row(out, "bad.md")[0] == "failed"
+
+
+def test_newnote_encoded_piece_by_piece_is_decoded(tmp_path):
+    couch = FakeCouch()
+    couch.put_chunk("h:p1", base64.b64encode(b"first piece").decode())   # 11 bytes: ends in = padding
+    couch.put_chunk("h:p2", base64.b64encode(b"second").decode())
+    couch.put_note("Views/Two.base", ["h:p1", "h:p2"], type="newnote")
+    out = _built(tmp_path, couch)
+    assert _row(out, "views/two.base")[0] == "ok"
+    assert [r.path for r in ask_built(out, "piecesecond")] == ["Views/Two.base"]
+
+
+def ask_built(out, query):
+    return sq.query_index(DB, query, None, 20, path=out).results
+
+
+def test_a_chunk_arrival_is_retried_even_past_the_cap(tmp_path, monkeypatch):
+    out = tmp_path / "idx.sqlite"
+    conn = si.connect(out)
+    si.create_schema(conn)
+    with conn:
+        for i in range(5):
+            si.put_note(conn, {"_id": f"new{i}", "path": f"new{i}.md", "children": ["h:gone"]}, {})
+        si.put_note(conn, {"_id": "late", "path": "late.md", "children": ["h:late"]}, {})
+        conn.execute("""INSERT INTO retry VALUES('late', 1, 50, '["h:late"]')""")
+    monkeypatch.setattr(si, "RETRY_MAX_PER_CYCLE", 2)
+    due = si.due_retries(conn, now=100, arrived={"h:late"}, exclude=set())
+    conn.close()
+    assert due[0] == "late" and len(due) == 3
+
+
+def test_build_records_no_pending_when_nothing_landed(tmp_path):
+    assert _meta(_built(tmp_path, _seeded()))["pending"] == "0"
+
+
+def test_build_records_changes_that_landed_during_it(tmp_path):
+    couch = _seeded()
+    original = couch.handler
+    landed = []
+
+    def handler(request):
+        # The listing is read after the sequence, so a write here is one the
+        # build's own snapshot misses and the follower must replay.
+        if request.url.path.endswith("/_all_docs") and not landed:
+            landed.append(True)
+            couch.put_chunk("h:x", "during")
+            couch.put_note("During.md", ["h:x"])
+        return original(request)
+
+    couch.handler = handler  # FakeClient binds the handler when it is built
+    assert int(_meta(_built(tmp_path, couch))["pending"]) == 2
+
+
+def test_index_from_another_fold_table_is_rebuilt_and_not_read(tmp_path, monkeypatch):
+    out = _built(tmp_path, _seeded())
+    assert si.index_is_current(out, DB)
+    monkeypatch.setattr(si, "FOLD_VERSION", "different")
+    assert not si.index_is_current(out, DB)
+    monkeypatch.setattr(sq, "FOLD_VERSION", "different")
+    conn = sqlite3.connect(out)
+    try:
+        with pytest.raises(sq.IndexUnavailable, match="fold table"):
+            sq.check_available(conn, DB)
+    finally:
+        conn.close()
+
+
+def test_blank_scan_error_is_named_not_left_blank(monkeypatch):
+    client = ObsidianVaultClient(Config(couch_url="http://x", db_name=DB))
+
+    async def blank(*a, **k):
+        raise TimeoutError("")
+
+    monkeypatch.setattr(client, "_search_notes_scan", blank)
+    with pytest.raises(SearchFallbackError) as info:
+        asyncio.run(client.search_notes_report("term"))
+    assert str(info.value).endswith("which then failed: TimeoutError")

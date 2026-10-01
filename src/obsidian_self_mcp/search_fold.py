@@ -22,6 +22,7 @@ either folding fails the suite rather than missing hits silently.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 
@@ -44,6 +45,11 @@ FOLD_ODD_RANGES = (
     (0x118A0, 0x118DF), (0x16E40, 0x16E7F), (0x1E900, 0x1E943),
 )
 SCAN_QUERY_CHARS = frozenset("İı")  # İ ı
+
+# Each indexed row stores its fold_odd flag, computed from FOLD_ODD_RANGES at
+# write time. An index built under a different table holds stale flags, so the
+# version is recorded in meta and a mismatch forces a rebuild.
+FOLD_VERSION = hashlib.sha1(repr(FOLD_ODD_RANGES).encode()).hexdigest()[:12]
 
 # Non-ASCII characters `re.IGNORECASE` treats as an ASCII letter. SQLite's
 # LIKE folds ASCII only, so a short ASCII query must also take any note that

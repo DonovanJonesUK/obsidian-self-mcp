@@ -52,7 +52,7 @@ import httpx
 
 from .client import ObsidianVaultClient
 from .config import Config
-from .search_fold import has_fold_odd
+from .search_fold import FOLD_VERSION, has_fold_odd
 
 # 2: fold_odd column, newnote bodies decoded, couch_origin and pending in meta.
 SCHEMA_VERSION = "2"
@@ -251,13 +251,16 @@ def put_note(
         reason = "malformed doc: children is not a list of chunk ids"
     elif missing := [c for c in ids if c not in chunks]:
         reason = f"{len(missing)} of {len(ids)} chunks missing"
+    elif bad := [c for c in ids if not isinstance(chunks[c], str)]:
+        reason = f"malformed chunk: {len(bad)} of {len(ids)} chunks hold no text"
+    elif doc.get("type") == "newnote":
+        decoded = decode_newnote([chunks[c] for c in ids])
+        if decoded is None:
+            reason = "binary content is not base64-encoded UTF-8 text"
+        else:
+            body = decoded
     else:
         body = "".join(chunks[c] for c in ids)
-        if doc.get("type") == "newnote":
-            try:
-                body = base64.b64decode(body, validate=True).decode("utf-8")
-            except (binascii.Error, ValueError):
-                reason = "binary content is not base64-encoded UTF-8 text"
     if reason:
         conn.execute(
             "INSERT INTO notes(id, path, path_lc, ext, rev, children_key, mtime,"
@@ -274,6 +277,36 @@ def put_note(
         "INSERT INTO notes_fts(rowid, body) VALUES(?, ?)", (cur.lastrowid, body)
     )
     return "ok"
+
+
+def decode_newnote(parts: list[str]) -> str | None:
+    """Decode a `newnote` doc's chunks to UTF-8 text, or None if they are not that.
+
+    This client's writer slices one base64 string across chunks, so the joined
+    text decodes. A writer that encodes each piece separately leaves padding
+    mid-stream, which only decodes piece by piece; both are tried. Every
+    production Base was a single chunk on 2026-10-01, so the second form is
+    covered by a test, not by observed data.
+    """
+    try:
+        return base64.b64decode("".join(parts), validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        pass
+    try:
+        return b"".join(base64.b64decode(p, validate=True) for p in parts).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+
+
+async def fetch_pending(client: ObsidianVaultClient, since: str) -> int:
+    """How many changes CouchDB holds after `since`."""
+    http = await client._get_client()
+    resp = await http.get("/_changes", params={"since": since, "limit": 1})
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data.get("pending"), int) or not isinstance(data.get("results"), list):
+        raise RuntimeError(f"_changes response has no pending count: {str(data)[:200]}")
+    return data["pending"] + len(data["results"])
 
 
 async def _update_seq(client: ObsidianVaultClient) -> str:
@@ -313,13 +346,18 @@ async def build(client: ObsidianVaultClient, out: Path) -> dict:
             with conn:
                 for d in group:
                     counts[put_note(conn, d, chunks)] += 1
+        # The changes that landed during the build, so a reader sees this lag
+        # rather than the fresh heartbeat alone.
+        pending = await fetch_pending(client, seq)
         with conn:
             set_meta(
                 conn,
                 schema_version=SCHEMA_VERSION,
+                fold_version=FOLD_VERSION,
                 db_name=client.config.db_name,
                 couch_origin=couch_origin(client.config.couch_url),
                 last_seq=seq,
+                pending=pending,
                 built_at=int(time.time()),
                 heartbeat_at=int(time.time()),
                 note_count=counts["ok"],
@@ -405,25 +443,29 @@ def due_retries(
     undo the hourly backoff for permanently damaged notes; matching the arrived
     ids against each note's recorded missing ids targets exactly the notes that
     could now succeed.
+
+    Those notes are always returned: an arrival is only seen in its own batch,
+    so capping it out would leave the note failed until its hourly retry. They
+    are bounded by the batch's chunk rows. The rest are capped at
+    RETRY_MAX_PER_CYCLE, never-tried first, then oldest try.
     """
-    due = []
+    arrivals, due = [], []
     for doc_id, first, last, missing in conn.execute(
         "SELECT n.id, r.first_failed_at, r.last_tried_at, r.missing FROM notes n"
         " LEFT JOIN retry r ON r.id = n.id WHERE n.status = 'failed'"
         " ORDER BY r.last_tried_at IS NOT NULL, r.last_tried_at, n.id"
     ):
-        if len(due) >= RETRY_MAX_PER_CYCLE:
-            break
         if doc_id in exclude:
             continue
-        if (
+        if first is not None and not arrived.isdisjoint(json.loads(missing)):
+            arrivals.append(doc_id)
+        elif len(due) < RETRY_MAX_PER_CYCLE and (
             first is None
             or now - first < RETRY_FAST_WINDOW
             or now - last >= RETRY_SLOW_INTERVAL
-            or not arrived.isdisjoint(json.loads(missing))
         ):
             due.append(doc_id)
-    return due
+    return arrivals + due
 
 
 async def fetch_changes(
@@ -597,6 +639,7 @@ def index_is_current(path: Path, db_name: str, origin: str | None = None) -> boo
         return False
     return (
         meta.get("schema_version") == SCHEMA_VERSION
+        and meta.get("fold_version") == FOLD_VERSION
         and meta.get("db_name") == db_name
         and (origin is None or meta.get("couch_origin") == origin)
         and meta.get("exts") == ",".join(sorted(indexed_exts()))

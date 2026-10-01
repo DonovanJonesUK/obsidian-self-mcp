@@ -1194,7 +1194,7 @@ class ObsidianVaultClient:
             results = await self._search_notes_scan(query, folder, limit)
         except Exception as exc:
             raise SearchFallbackError(
-                f"{notice}, which then failed: {exc or type(exc).__name__}"
+                f"{notice}, which then failed: {str(exc) or type(exc).__name__}"
             ) from exc
         return SearchReport(results=results, notice=notice)
 

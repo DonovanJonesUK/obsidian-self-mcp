@@ -31,6 +31,7 @@ def make_index(tmp_path, notes, *, heartbeat_age=0, db_name=DB, schema=None):
         si.set_meta(
             conn,
             schema_version=schema or si.SCHEMA_VERSION,
+            fold_version=si.FOLD_VERSION,
             db_name=db_name,
             couch_origin=si.couch_origin("http://x"),
             last_seq="1-x",

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import SearchResult
-from .search_fold import ascii_query_equivalents, needs_scan
+from .search_fold import FOLD_VERSION, ascii_query_equivalents, needs_scan
 from .search_index import SCHEMA_VERSION, default_index_path, get_meta
 
 DEFAULT_STALE_SECONDS = 300
@@ -111,6 +111,10 @@ def check_available(
     if meta.get("schema_version") != SCHEMA_VERSION:
         raise IndexUnavailable(
             f"schema_version {meta.get('schema_version')!r} is not {SCHEMA_VERSION!r}"
+        )
+    if meta.get("fold_version") != FOLD_VERSION:
+        raise IndexUnavailable(
+            f"index built with fold table {meta.get('fold_version')!r}, not {FOLD_VERSION!r}"
         )
     if meta.get("db_name") != db_name:
         raise IndexUnavailable(
@@ -217,8 +221,8 @@ def query_index(
     A candidate is only reported after a case-insensitive substring check in
     Python, so the FTS5 trigram match can over-select but never decides a hit.
     Ranking is by occurrence count, then path. Occurrences are counted with
-    `findall`, never by materialising match objects: a one-letter query has
-    millions of them.
+    `subn`, never by materialising matches: a one-letter query has millions of
+    them, and both a match-object list and `findall`'s list grow with the count.
     """
     validate_query(query, limit)
     conn = _open_ro(path or default_index_path(db_name))
@@ -228,7 +232,8 @@ def query_index(
         pattern = re.compile(re.escape(query), re.IGNORECASE)
         hits: list[tuple[int, str, list[str]]] = []
         for note_path, body in _candidates(conn, query, folder_prefix):
-            count = len(pattern.findall(body))
+            # subn's count streams; its output string is at most the body's size.
+            count = pattern.subn("", body)[1]
             if not count:
                 continue
             snippets = [

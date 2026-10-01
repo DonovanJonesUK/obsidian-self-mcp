@@ -17,8 +17,9 @@ Type=simple
 EnvironmentFile=%h/rwf-webhook.env
 # The instance name picks the database; OBSIDIAN_COUCH_DB wins over COUCHDB_DB.
 Environment=OBSIDIAN_COUCH_DB=%i
-Environment=PYTHONPATH=%h/obsidian-self-mcp-wt/search-index/src
-WorkingDirectory=%h/obsidian-self-mcp-wt/search-index
+# Runs the main checkout, the same code the MCP server imports.
+Environment=PYTHONPATH=%h/obsidian-self-mcp/src
+WorkingDirectory=%h/obsidian-self-mcp
 ExecStartPre=%h/obsidian-self-mcp/.venv/bin/python scripts/wait_for_couchdb.py 180
 ExecStart=%h/obsidian-self-mcp/.venv/bin/python -m obsidian_self_mcp.search_index follow
 Restart=always

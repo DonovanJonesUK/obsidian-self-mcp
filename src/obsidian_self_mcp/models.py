@@ -54,6 +54,14 @@ class SearchResult:
 
 
 @dataclass
+class SearchReport:
+    results: list[SearchResult]
+    notice: str | None = None  # first line: set when the live scan answered instead of the index
+    footer: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class BacklinkInfo:
     source_path: str
     context: str  # surrounding text snippet

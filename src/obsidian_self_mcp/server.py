@@ -107,15 +107,22 @@ async def search_notes(
         limit: Max results to return (default 20)
     """
     client = _get_client()
-    results = await client.search_notes(query=query, folder=folder, limit=limit)
-    if not results:
-        return f"No results for: {query}"
+    report = await client.search_notes_report(query=query, folder=folder, limit=limit)
     lines = []
-    for r in results:
-        lines.append(f"\n## {r.path} ({r.matches} matches)")
-        for s in r.snippets:
-            lines.append(f"  > {s}")
-    return f"Found matches in {len(results)} notes:" + "\n".join(lines)
+    if report.notice:
+        lines.append(report.notice)
+    if not report.results:
+        lines.append(f"No results for: {query}")
+    else:
+        lines.append(f"Found matches in {len(report.results)} notes:")
+        for r in report.results:
+            lines.append(f"\n## {r.path} ({r.matches} matches)")
+            for s in r.snippets:
+                lines.append(f"  > {s}")
+    lines.extend(f"\nWarning: {w}" for w in report.warnings)
+    if report.footer:
+        lines.append(f"\n{report.footer}")
+    return "\n".join(lines)
 
 
 @mcp.tool()

@@ -12,7 +12,7 @@ from collections import defaultdict
 import httpx
 
 from .config import Config
-from .models import BacklinkFailure, BacklinkInfo, FolderInfo, NoteContent, NoteMetadata, SearchResult
+from .models import BacklinkFailure, BacklinkInfo, FolderInfo, NoteContent, NoteMetadata, SearchReport, SearchResult
 from .prose import normalize_prose
 from .utils import (
     encode_doc_id,
@@ -1145,6 +1145,44 @@ class ObsidianVaultClient:
     SEARCH_FIND_TIMEOUT = 120.0
 
     async def search_notes(
+        self, query: str, folder: str | None = None, limit: int = 20
+    ) -> list[SearchResult]:
+        return (await self.search_notes_report(query, folder, limit)).results
+
+    async def search_notes_report(
+        self, query: str, folder: str | None = None, limit: int = 20
+    ) -> SearchReport:
+        """Search through the SQLite index, or announce a fallback to the live scan.
+
+        SAI-DEC-240: when the index is unavailable (file missing, schema or
+        database mismatch, stale heartbeat) or `OBSIDIAN_SEARCH_INDEX=0`, the
+        legacy scan answers and `notice` names the reason. An index that is
+        available but errors is not silently retried against CouchDB: that would
+        hide a defect, so it is announced the same way.
+        """
+        from . import search_query
+
+        if not search_query.index_enabled():
+            reason = "index disabled (OBSIDIAN_SEARCH_INDEX=0)"
+        else:
+            try:
+                answer = await asyncio.to_thread(
+                    search_query.query_index,
+                    self.config.db_name, query, folder, limit,
+                )
+            except search_query.IndexUnavailable as exc:
+                reason = f"index unavailable ({exc})"
+            else:
+                warning = search_query.format_failed(answer.failed_in_scope)
+                return SearchReport(
+                    results=answer.results,
+                    footer=answer.footer,
+                    warnings=[warning] if warning else [],
+                )
+        results = await self._search_notes_scan(query, folder, limit)
+        return SearchReport(results=results, notice=f"{reason}; fell back to live scan")
+
+    async def _search_notes_scan(
         self, query: str, folder: str | None = None, limit: int = 20
     ) -> list[SearchResult]:
         """Search note content using chunk scanning with reverse map.

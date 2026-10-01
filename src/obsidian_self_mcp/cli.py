@@ -184,19 +184,24 @@ async def _cmd_write(client: ObsidianVaultClient, args):
 
 async def _cmd_search(client: ObsidianVaultClient, args):
     try:
-        results = await client.search_notes(
+        report = await client.search_notes_report(
             query=args.query, folder=args.d, limit=args.n
         )
     except SearchTimeoutError as e:
         print(f"Search failed: {e}", file=sys.stderr)
         sys.exit(1)
-    if not results:
+    if report.notice:
+        print(report.notice)
+    if not report.results:
         print(f"No results for: {args.query}")
-        return
-    for r in results:
+    for r in report.results:
         print(f"\n{r.path} ({r.matches} matches)")
         for s in r.snippets:
             print(f"  > {s}")
+    for w in report.warnings:
+        print(f"\nWarning: {w}")
+    if report.footer:
+        print(f"\n{report.footer}")
 
 
 async def _cmd_append(client: ObsidianVaultClient, args):

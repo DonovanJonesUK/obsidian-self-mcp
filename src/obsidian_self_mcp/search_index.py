@@ -710,7 +710,11 @@ def main(argv: list[str] | None = None) -> None:
             finally:
                 await client.close()
 
-        asyncio.run(run_follow())
+        try:
+            asyncio.run(run_follow())
+        except IndexBusy as exc:
+            _log(f"follow: {exc}")
+            sys.exit(1)
         _log("follow: stopped")
         return
 
@@ -722,7 +726,11 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             await client.close()
 
-    result = asyncio.run(run())
+    try:
+        result = asyncio.run(run())
+    except IndexBusy as exc:
+        _log(f"build refused: {exc}")
+        sys.exit(1)
     print(f"built {out}: {result}")
 
 

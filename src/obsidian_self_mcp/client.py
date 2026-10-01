@@ -1119,6 +1119,8 @@ class ObsidianVaultClient:
     # so a broad query cannot scan without bound.
     CHUNK_BUDGET_PER_NOTE = 25
     CHUNK_BUDGET_MAX = 5000
+    # The /_find scan is un-indexed and grows with the vault; the client's 30 s default no longer covers it.
+    SEARCH_SCAN_TIMEOUT_SECONDS = 180.0
 
     # Snippets quoted per note in the result (unchanged from the original).
     SNIPPETS_PER_NOTE = 3
@@ -1176,7 +1178,9 @@ class ObsidianVaultClient:
             "fields": ["_id"],
             "limit": chunk_budget,
         }
-        resp = await client.post("/_find", json=mango)
+        resp = await client.post(
+            "/_find", json=mango, timeout=self.SEARCH_SCAN_TIMEOUT_SECONDS
+        )
         resp.raise_for_status()
         matching_ids = [d["_id"] for d in resp.json().get("docs", []) if "_id" in d]
 

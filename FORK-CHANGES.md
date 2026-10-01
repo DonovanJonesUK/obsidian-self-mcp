@@ -53,3 +53,5 @@ The fork does not give general round-trip byte fidelity. Shell `$(...)` still st
 `update_frontmatter` prepends a second block rather than merging, so a note that already has frontmatter must be read, rebuilt and written whole.
 
 `search_notes` still runs an un-indexed Mango regex, so every search is a full scan of every chunk document and its cost tracks vault size and rarity of the term rather than result count. Measured on production 2026-09-10: a rare phrase took 32s and a term with no matches took 31.6s. CouchDB says so in the response itself, `"No matching index found, create an index to optimize query time."` Base64 attachment chunks under the 256 KB snippet guard also still surface as results with unreadable snippets, so LiveSync plugin documents appear alongside notes.
+
+`search_notes` sets its own 180 s timeout on the `/_find` scan (`SEARCH_SCAN_TIMEOUT_SECONDS`); the shared client keeps its 30 s default. Measured on production 2026-10-01: about 55 s for any term, matched or not, which exceeded 30 s and surfaced as an empty tool error.

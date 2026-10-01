@@ -6,7 +6,7 @@ No Obsidian app required. Works on headless servers, in CI pipelines, from AI ag
 
 ## Differences from upstream
 
-This is a fork of [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), 20 commits ahead and 0 behind, maintained against a production vault since June 2026.
+This is a fork of [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), 38 commits ahead and 0 behind, maintained against a production vault since June 2026.
 
 **Eight of those commits fix data-integrity defects inherited from the original release.** If you are running the upstream version or another fork, these are the ones that matter:
 
@@ -20,6 +20,8 @@ This is a fork of [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri
 - **`obsidian read` appended a newline the note did not contain**, so any read-then-write round trip grew the file by a byte per cycle.
 
 It also adds `rename_note` with wikilink backlink propagation, a delegated write path using a `livesync-commonlib`-backed writer, opt-in prose normalisation, and substantial startup and query-cost work.
+
+**`search_notes` can answer from a full-text index instead of scanning CouchDB.** The original search runs a regex over every chunk document, which CouchDB cannot index, so its cost grows with the whole database. On a vault of about 300,000 CouchDB documents a rare term took around 50 s and failed against the client timeout. With the optional index the same searches take well under a second. See [Search index](#search-index-optional) below.
 
 Full detail, including what is deliberately *not* fixed: [FORK-CHANGES.md](FORK-CHANGES.md).
 
@@ -43,7 +45,7 @@ Obsidian has an [official CLI](https://obsidian.md/blog/introducing-obsidian-cli
 | **Requires Obsidian app** | Yes (must be running) | No |
 | **Requires Catalyst license** | Yes ($25+) | No (MIT, free) |
 | **Read/write notes** | Yes | Yes |
-| **Search** | Yes | Yes |
+| **Search** | Yes | Yes (optional full-text index) |
 | **Frontmatter/properties** | Yes | Yes |
 | **Tags** | Yes | Yes |
 | **Backlinks** | Yes (via app index) | Yes (content scanning) |
@@ -82,7 +84,7 @@ Set these environment variables:
 export OBSIDIAN_COUCH_URL="http://your-couchdb-host:5984"
 export OBSIDIAN_COUCH_USER="your-username"
 export OBSIDIAN_COUCH_PASS="your-password"
-export OBSIDIAN_COUCH_DB="obsidian-vault"    # optional, defaults to "obsidian-vault"
+export OBSIDIAN_COUCH_DB="obsidian-vault"    # required: there is no default
 ```
 
 ## MCP Server Setup
@@ -136,7 +138,7 @@ Add to your Claude Code settings (`.claude/settings.json` or global):
 | `list_notes` | List notes with metadata, optionally filtered by folder |
 | `read_note` | Read the full content of a note |
 | `write_note` | Create or update a note |
-| `search_notes` | Search note content (case-insensitive) |
+| `search_notes` | Search note content (case-insensitive substring), from the search index when one is running |
 | `append_note` | Append content to an existing note |
 | `delete_note` | Soft-delete a note, LiveSync-style (chunks left intact) |
 | `list_folders` | List all folders with note counts |
@@ -201,6 +203,83 @@ obsidian rename "Notes/old-name.md" "Notes/new-name.md" -y  # skip confirmation
 obsidian folders
 obsidian tree                            # alias
 ```
+
+## Search index (optional)
+
+Without it, `search_notes` runs a regex over every chunk document in the database. CouchDB cannot index a regex, so every search reads the whole database, orphaned chunks included, and the cost grows with the vault. For a small vault that is fine. On a large one, rare terms and terms with no matches become the slowest searches of all.
+
+The index is a small follower process that keeps a SQLite file with one row per note: the note's full text, reassembled from its chunks, under an FTS5 trigram index. It follows CouchDB's `_changes` feed, so an edit is searchable within seconds. `search_notes` and `obsidian search` read that file when it exists and is current.
+
+**Measured on one production vault** (11,700 notes, about 320,000 CouchDB documents):
+
+| | Live scan | Index |
+|---|---|---|
+| Rare term | about 50 s, usually a timeout | 0.01 to 0.3 s |
+| Term with no matches | 49.5 s | under 0.01 s |
+| Index file | | 181 MB |
+| Full build | | about 60 s |
+| Follower memory | | about 125 MiB |
+
+**Beyond speed:**
+
+- A term that straddles a chunk boundary is found.
+- Notes that share a chunk are each returned.
+- A folder filter is exact and applied before the result limit.
+- Base64 attachments and plugin bundles no longer match short terms.
+- `.base` files are searched as their decoded text.
+- `matches` counts occurrences in the note rather than chunks.
+
+### What it guarantees
+
+- **It never writes to CouchDB.** The only file it writes is its own index.
+- **Partial notes are not indexed.** A note with a missing or malformed chunk is recorded as not indexed, never indexed from partial text, and any search whose scope includes it lists it.
+- **Soft deletes are honoured.** A note LiveSync soft-deletes (`deleted: true` in the document) leaves the index.
+- **A stale or mismatched index is never used silently.** It falls back to the live scan when any of these holds:
+  - the file is missing;
+  - it was built for another database, server or schema;
+  - its follower has not reported for more than 5 minutes;
+  - CouchDB holds more than 1,000 changes it has not applied yet.
+
+  When it falls back, **the first line of the result says why**.
+
+### Requirements and limits
+
+- **SQLite 3.34 or later**, for the trigram tokenizer. Check with `python -c "import sqlite3; print(sqlite3.sqlite_version)"`.
+- **Plain-text vaults only.** Nothing in this project decrypts. A vault using LiveSync's end-to-end encryption or path obfuscation cannot be read by it at all, index or not.
+- **Indexed types:** `.md`, `.canvas`, `.base` and `.txt` by default. Set `OBSIDIAN_SEARCH_INDEX_EXTS` to change the list; the follower rebuilds when it does.
+- **One follower per database**, running as the same user as the MCP server. Both use `~/.local/state/obsidian-self-mcp/search-<database>.sqlite`, or `$OBSIDIAN_SEARCH_INDEX_DIR` if set.
+
+### Running it
+
+The follower builds the index on first start, then keeps it current:
+
+```bash
+python -m obsidian_self_mcp.search_index follow     # long-running; builds first if needed
+python -m obsidian_self_mcp.search_index stats      # note counts, size, last sequence
+```
+
+A systemd user unit is included at `systemd/obsidian-search-index@.service`, one instance per database name. Before installing it, edit `EnvironmentFile` to point at a file holding your CouchDB credentials, and `WorkingDirectory`, `PYTHONPATH` and the two Python paths to match your checkout. Then:
+
+```bash
+cp systemd/obsidian-search-index@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now obsidian-search-index@<your-database>.service
+loginctl enable-linger "$USER"     # so it starts at boot without a login
+```
+
+A manual `build` refuses while a follower holds the index, so stop the unit first if you want to rebuild by hand.
+
+### Settings
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OBSIDIAN_SEARCH_INDEX` | on | `0`, `false`, `off` or `no` forces the live scan |
+| `OBSIDIAN_SEARCH_INDEX_EXTS` | `md,canvas,base,txt` | File types indexed |
+| `OBSIDIAN_SEARCH_INDEX_STALE_SECONDS` | `300` | Follower silence after which the index is not used |
+| `OBSIDIAN_SEARCH_INDEX_MAX_PENDING` | `1000` | Unapplied changes after which the index is not used |
+| `OBSIDIAN_SEARCH_INDEX_DIR` | `~/.local/state/obsidian-self-mcp` | Where index files live |
+
+Design notes and the defects found in review are in [FORK-CHANGES.md](FORK-CHANGES.md).
 
 ## How LiveSync stores data
 

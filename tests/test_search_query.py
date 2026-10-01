@@ -95,6 +95,17 @@ def test_trigram_overselection_is_confirmed_in_python(tmp_path):
     assert ask(p, "abcdef").results == []
 
 
+@pytest.mark.parametrize("folder", [None, "projects/"])
+def test_match_drives_the_join_from_the_fts_table(tmp_path, folder):
+    # Driving from notes re-runs the MATCH once per note: 8 to 23 s on production.
+    p = make_index(tmp_path, {f"n{i}.md": f"body {i}" for i in range(50)})
+    conn = sq._open_ro(p)
+    sql, args = sq._candidate_sql("body", folder)
+    plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, args)]
+    conn.close()
+    assert "VIRTUAL TABLE" in plan[0], plan
+
+
 def test_missing_chunk_note_is_listed_not_searched(tmp_path):
     p = make_index(tmp_path, {"ok.md": "term", "gap.md": None})
     got = ask(p, "term")

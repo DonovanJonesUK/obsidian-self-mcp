@@ -87,16 +87,19 @@ def _fts_phrase(query: str) -> str:
     return '"' + query.replace('"', '""') + '"'
 
 
-def _candidates(conn: sqlite3.Connection, query: str, folder_prefix: str | None):
-    """Yield (path, body) for ok notes that may contain the query."""
+def _candidate_sql(query: str, folder_prefix: str | None) -> tuple[str, list]:
+    """Return the candidate SELECT and its arguments for one search."""
     where, params = ["n.status = 'ok'"], []
     if folder_prefix:
         where.append("substr(n.path_lc, 1, ?) = ?")
         params += [len(folder_prefix), folder_prefix]
     scope = " AND ".join(where)
     if len(query) >= 3:
+        # CROSS JOIN pins notes_fts as the outer loop. With a plain JOIN the
+        # planner drives from notes through the status index and re-runs the
+        # MATCH once per note: 8 to 23 s on production against 0.03 s.
         sql = (
-            "SELECT n.path, f.body FROM notes_fts f JOIN notes n ON n.rowid = f.rowid "
+            "SELECT n.path, f.body FROM notes_fts f CROSS JOIN notes n ON n.rowid = f.rowid "
             f"WHERE notes_fts MATCH ? AND {scope}"
         )
         args = [_fts_phrase(query), *params]
@@ -113,6 +116,12 @@ def _candidates(conn: sqlite3.Connection, query: str, folder_prefix: str | None)
             f"WHERE {scope}"
         )
         args = params
+    return sql, args
+
+
+def _candidates(conn: sqlite3.Connection, query: str, folder_prefix: str | None):
+    """Yield (path, body) for ok notes that may contain the query."""
+    sql, args = _candidate_sql(query, folder_prefix)
     yield from conn.execute(sql, args)
 
 

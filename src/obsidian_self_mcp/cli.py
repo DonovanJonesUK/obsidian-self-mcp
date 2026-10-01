@@ -23,7 +23,7 @@ for _m in _blocked:
     sys.modules[_m] = None
 
 try:
-    from .client import ObsidianVaultClient, SearchTimeoutError  # noqa: E402
+    from .client import ObsidianVaultClient, SearchFallbackError, SearchTimeoutError  # noqa: E402
     from .config import Config  # noqa: E402
 finally:
     for _m in _blocked:
@@ -187,7 +187,7 @@ async def _cmd_search(client: ObsidianVaultClient, args):
         report = await client.search_notes_report(
             query=args.query, folder=args.d, limit=args.n
         )
-    except SearchTimeoutError as e:
+    except (SearchFallbackError, SearchTimeoutError, ValueError) as e:
         print(f"Search failed: {e}", file=sys.stderr)
         sys.exit(1)
     if report.notice:

@@ -92,6 +92,14 @@ class SearchTimeoutError(RuntimeError):
     """
 
 
+class SearchFallbackError(RuntimeError):
+    """The index was unavailable and the live scan that replaced it failed too.
+
+    The message starts with the reason the index was not used, so the first
+    line of the failure still says why the fallback ran (SAI-DEC-240).
+    """
+
+
 def _replace_wikilink_target(content: str, old_name: str, new_name: str) -> str:
     """Replace [[OldName...]] wikilinks with [[NewName...]], case-insensitive on filename.
 
@@ -1154,21 +1162,23 @@ class ObsidianVaultClient:
     ) -> SearchReport:
         """Search through the SQLite index, or announce a fallback to the live scan.
 
-        SAI-DEC-240: when the index is unavailable (file missing, schema or
-        database mismatch, stale heartbeat) or `OBSIDIAN_SEARCH_INDEX=0`, the
-        legacy scan answers and `notice` names the reason. An index that is
-        available but errors is not silently retried against CouchDB: that would
-        hide a defect, so it is announced the same way.
+        SAI-DEC-240: when the index is unavailable (file missing, schema,
+        database or server mismatch, stale heartbeat, too many changes pending)
+        or switched off by `OBSIDIAN_SEARCH_INDEX`, the legacy scan answers and
+        `notice` names the reason. If the scan then fails too, the error it
+        raises still starts with that reason.
         """
         from . import search_query
+        from .search_index import couch_origin
 
-        if not search_query.index_enabled():
-            reason = "index disabled (OBSIDIAN_SEARCH_INDEX=0)"
-        else:
+        search_query.validate_query(query, limit)
+        reason = search_query.index_disabled_reason()
+        if reason is None:
             try:
                 answer = await asyncio.to_thread(
                     search_query.query_index,
                     self.config.db_name, query, folder, limit,
+                    None, couch_origin(self.config.couch_url),
                 )
             except search_query.IndexUnavailable as exc:
                 reason = f"index unavailable ({exc})"
@@ -1179,8 +1189,14 @@ class ObsidianVaultClient:
                     footer=answer.footer,
                     warnings=[warning] if warning else [],
                 )
-        results = await self._search_notes_scan(query, folder, limit)
-        return SearchReport(results=results, notice=f"{reason}; fell back to live scan")
+        notice = f"{reason}; fell back to live scan"
+        try:
+            results = await self._search_notes_scan(query, folder, limit)
+        except Exception as exc:
+            raise SearchFallbackError(
+                f"{notice}, which then failed: {exc or type(exc).__name__}"
+            ) from exc
+        return SearchReport(results=results, notice=notice)
 
     async def _search_notes_scan(
         self, query: str, folder: str | None = None, limit: int = 20

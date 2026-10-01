@@ -32,6 +32,7 @@ def make_index(tmp_path, notes, *, heartbeat_age=0, db_name=DB, schema=None):
             conn,
             schema_version=schema or si.SCHEMA_VERSION,
             db_name=db_name,
+            couch_origin=si.couch_origin("http://x"),
             last_seq="1-x",
             heartbeat_at=int(time.time()) - heartbeat_age,
             note_count=len(notes),
@@ -96,14 +97,18 @@ def test_trigram_overselection_is_confirmed_in_python(tmp_path):
 
 
 @pytest.mark.parametrize("folder", [None, "projects/"])
-def test_match_drives_the_join_from_the_fts_table(tmp_path, folder):
-    # Driving from notes re-runs the MATCH once per note: 8 to 23 s on production.
+def test_match_runs_once_not_once_per_note(tmp_path, folder):
+    # A plan that drove from notes re-ran the MATCH per note: 8 to 23 s on
+    # production. FTS5 marks a MATCH constraint with M in the plan's index
+    # string, so it must appear exactly once, and never on a row lookup.
     p = make_index(tmp_path, {f"n{i}.md": f"body {i}" for i in range(50)})
     conn = sq._open_ro(p)
     sql, args = sq._candidate_sql("body", folder)
     plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, args)]
     conn.close()
-    assert "VIRTUAL TABLE" in plan[0], plan
+    fts = [r.split("VIRTUAL TABLE INDEX ", 1)[1] for r in plan if "VIRTUAL TABLE INDEX" in r]
+    assert [i for i in fts if "M" in i] == ["0:M1"], plan
+    assert all("=" not in i for i in fts if "M" in i), plan
 
 
 def test_missing_chunk_note_is_listed_not_searched(tmp_path):

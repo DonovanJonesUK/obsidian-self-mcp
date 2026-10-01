@@ -66,7 +66,9 @@ class FakeCouch:
                     latest.pop(doc_id, None)  # CouchDB reports each id once, at its latest seq
                     latest[doc_id] = (seq, deleted)
             rows = []
-            for doc_id, (seq, deleted) in sorted(latest.items(), key=lambda kv: kv[1][0])[:limit]:
+            ordered = sorted(latest.items(), key=lambda kv: kv[1][0])
+            pending = max(0, len(ordered) - limit)
+            for doc_id, (seq, deleted) in ordered[:limit]:
                 row = {"seq": str(seq), "id": doc_id, "changes": [{"rev": "x"}]}
                 if deleted:
                     row["deleted"] = True
@@ -75,7 +77,7 @@ class FakeCouch:
                     row["doc"] = dict(self.docs[doc_id])
                 rows.append(row)
             last = rows[-1]["seq"] if rows else str(since)
-            return httpx.Response(200, json={"results": rows, "last_seq": last})
+            return httpx.Response(200, json={"results": rows, "last_seq": last, "pending": pending})
         if request.method == "GET" and tail == "/_all_docs":
             params = request.url.params
             start = json.loads(params["startkey"]) if "startkey" in params else ""

@@ -11,7 +11,7 @@ import asyncio
 import httpx
 import pytest
 
-from obsidian_self_mcp.client import ObsidianVaultClient, SearchTimeoutError
+from obsidian_self_mcp.client import ObsidianVaultClient, SearchFallbackError, SearchTimeoutError
 from obsidian_self_mcp.config import Config
 
 
@@ -70,13 +70,19 @@ def test_find_timeout_raises_non_blank_actionable_error():
 
     async def go():
         try:
-            with pytest.raises(SearchTimeoutError) as info:
+            with pytest.raises(SearchFallbackError) as info:
                 await v.search_notes("rare phrase")
             return info.value
         finally:
             await v.close()
 
-    exc = run(go())
+    fallback = run(go())
+    # The scan only runs as the fallback, so its failure must still lead with
+    # why the index was not used (SAI-DEC-240), then carry the scan's own text.
+    assert str(fallback).startswith("index unavailable (")
+    exc = fallback.__cause__
+    assert isinstance(exc, SearchTimeoutError)
+    assert str(exc) in str(fallback)
     msg = str(exc)
     assert msg.strip() != ""
     assert "timed out after" in msg and "s:" in msg
@@ -148,9 +154,13 @@ def test_non_timeout_errors_are_not_rewrapped():
 
     async def go():
         try:
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(SearchFallbackError) as info:
                 await v.search_notes("rare phrase")
+            return info.value
         finally:
             await v.close()
 
-    run(go())
+    fallback = run(go())
+    assert isinstance(fallback.__cause__, httpx.ConnectError)
+    assert "timed out" not in str(fallback)
+    assert str(fallback).startswith("index unavailable (")

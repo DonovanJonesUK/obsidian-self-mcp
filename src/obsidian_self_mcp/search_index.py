@@ -35,6 +35,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -48,8 +52,10 @@ import httpx
 
 from .client import ObsidianVaultClient
 from .config import Config
+from .search_fold import has_fold_odd
 
-SCHEMA_VERSION = "1"
+# 2: fold_odd column, newnote bodies decoded, couch_origin and pending in meta.
+SCHEMA_VERSION = "2"
 DEFAULT_EXTS = "md,canvas,base,txt"
 # Notes per chunk-fetch round. Bounds memory to one group's text at a time.
 BUILD_GROUP = 200
@@ -65,6 +71,9 @@ RETRY_READ_BATCH = 400
 RETRY_FAST_WINDOW = 600
 # ...and then at most this often, unless one of its missing chunks arrives.
 RETRY_SLOW_INTERVAL = 3600
+# Failed notes re-read per cycle at most, so a build that leaves many notes
+# failed cannot stretch one cycle past the heartbeat threshold.
+RETRY_MAX_PER_CYCLE = 200
 BACKOFF_CAP = 60.0
 # Ids that are never notes: LiveSync chunks, its index docs, design docs.
 NOT_NOTE_PREFIXES = ("h:", "ix:", "_design/")
@@ -88,8 +97,57 @@ def default_index_path(db_name: str) -> Path:
     return Path(base) / f"search-{db_name}.sqlite"
 
 
+class IndexBusy(Exception):
+    """Another process holds the index file; building now would race it."""
+
+
+def doc_path(doc: dict) -> str:
+    """The doc's path, or its id when `path` is missing or not a string."""
+    path = doc.get("path")
+    return path if isinstance(path, str) else doc["_id"]
+
+
+def couch_origin(couch_url: str) -> str:
+    """scheme://host:port of the CouchDB server, without credentials or path."""
+    url = httpx.URL(couch_url)
+    return f"{url.scheme}://{url.host}:{url.port or (443 if url.scheme == 'https' else 80)}"
+
+
+def chunk_ids(doc: dict) -> list[str] | None:
+    """The doc's chunk ids, or None when `children` is not a list of strings."""
+    ids = doc.get("children")
+    if isinstance(ids, list) and all(isinstance(c, str) for c in ids):
+        return ids
+    return None
+
+
 def children_key(doc: dict) -> str:
-    return hashlib.sha1("\0".join(doc.get("children", [])).encode()).hexdigest()
+    ids = chunk_ids(doc)
+    if ids is None:
+        return "malformed"
+    return hashlib.sha1("\0".join(ids).encode()).hexdigest()
+
+
+@contextlib.contextmanager
+def index_lock(out: Path):
+    """Hold an exclusive lock on `out` for as long as this process writes it.
+
+    The follower holds it for its lifetime and a CLI build takes it, so a build
+    can never replace the file under a running follower: the follower would keep
+    writing its old WAL, which by path shadows the new file for every reader.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f"{out}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise IndexBusy(
+                f"{out} is held by another process (the follower service?); stop it first"
+            ) from None
+        yield
+    finally:
+        os.close(fd)
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -117,10 +175,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
           children_key TEXT NOT NULL,
           mtime INTEGER,
           status TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
-          reason TEXT
+          reason TEXT,
+          fold_odd INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS notes_path_lc ON notes(path_lc);
         CREATE INDEX IF NOT EXISTS notes_status ON notes(status);
+        CREATE INDEX IF NOT EXISTS notes_fold_odd ON notes(fold_odd) WHERE fold_odd = 1;
         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
           body, tokenize='trigram'
         );
@@ -166,28 +226,49 @@ def put_note(
 
     Returns 'ok' or 'failed'. Idempotent: replaying the same doc leaves the same
     row, which is what makes a replayed change-feed sequence safe.
+
+    Never raises on the doc's shape. A doc whose fields are malformed becomes a
+    failed row with the reason, because one bad doc raising here would crash
+    the follower and systemd would restart it into the same doc forever.
+    A `newnote` doc holds base64; its decoded text is what gets indexed.
     """
     doc_id = doc["_id"]
     path = doc.get("path", doc_id)
-    children = doc.get("children", [])
-    missing = [c for c in children if c not in chunks]
+    reason = None
+    if not isinstance(path, str):
+        path, reason = doc_id, "malformed doc: path is not a string"
+    rev, mtime = doc.get("_rev", ""), doc.get("mtime")
     remove_note(conn, doc_id)
     common = (
-        doc_id, path, path.lower(), ext_of(path), doc.get("_rev", ""),
-        children_key(doc), doc.get("mtime"),
+        doc_id, path, path.lower(), ext_of(path), rev if isinstance(rev, str) else str(rev),
+        children_key(doc), mtime if isinstance(mtime, int) else None,
     )
-    if missing:
+    ids = chunk_ids(doc)
+    body = ""
+    if reason:
+        pass
+    elif ids is None:
+        reason = "malformed doc: children is not a list of chunk ids"
+    elif missing := [c for c in ids if c not in chunks]:
+        reason = f"{len(missing)} of {len(ids)} chunks missing"
+    else:
+        body = "".join(chunks[c] for c in ids)
+        if doc.get("type") == "newnote":
+            try:
+                body = base64.b64decode(body, validate=True).decode("utf-8")
+            except (binascii.Error, ValueError):
+                reason = "binary content is not base64-encoded UTF-8 text"
+    if reason:
         conn.execute(
             "INSERT INTO notes(id, path, path_lc, ext, rev, children_key, mtime,"
             " status, reason) VALUES(?, ?, ?, ?, ?, ?, ?, 'failed', ?)",
-            (*common, f"{len(missing)} of {len(children)} chunks missing"),
+            (*common, reason),
         )
         return "failed"
-    body = "".join(chunks[c] for c in children)
     cur = conn.execute(
         "INSERT INTO notes(id, path, path_lc, ext, rev, children_key, mtime,"
-        " status, reason) VALUES(?, ?, ?, ?, ?, ?, ?, 'ok', NULL)",
-        common,
+        " status, reason, fold_odd) VALUES(?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?)",
+        (*common, int(has_fold_odd(body))),
     )
     conn.execute(
         "INSERT INTO notes_fts(rowid, body) VALUES(?, ?)", (cur.lastrowid, body)
@@ -205,15 +286,16 @@ async def _update_seq(client: ObsidianVaultClient) -> str:
 async def build(client: ObsidianVaultClient, out: Path) -> dict:
     """Build a fresh index into `out`, atomically replacing any existing file.
 
-    The sequence is read before the listing, so a change landing during the
-    build is replayed by the follower rather than lost; replay is idempotent.
+    The caller must hold `index_lock(out)`. The sequence is read before the
+    listing, so a change landing during the build is replayed by the follower
+    rather than lost; replay is idempotent.
     """
     started = time.monotonic()
     seq = await _update_seq(client)
     exts = indexed_exts()
     docs = [
         d for d in await client._get_all_file_docs()
-        if ext_of(d.get("path", d["_id"])) in exts
+        if ext_of(doc_path(d)) in exts
     ]
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +308,7 @@ async def build(client: ObsidianVaultClient, out: Path) -> dict:
         create_schema(conn)
         for i in range(0, len(docs), BUILD_GROUP):
             group = docs[i : i + BUILD_GROUP]
-            ids = [c for d in group for c in d.get("children", [])]
+            ids = [c for d in group for c in (chunk_ids(d) or [])]
             chunks = await client._fetch_chunks_batched(ids) if ids else {}
             with conn:
                 for d in group:
@@ -236,6 +318,7 @@ async def build(client: ObsidianVaultClient, out: Path) -> dict:
                 conn,
                 schema_version=SCHEMA_VERSION,
                 db_name=client.config.db_name,
+                couch_origin=couch_origin(client.config.couch_url),
                 last_seq=seq,
                 built_at=int(time.time()),
                 heartbeat_at=int(time.time()),
@@ -246,6 +329,12 @@ async def build(client: ObsidianVaultClient, out: Path) -> dict:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
+    # An old WAL beside `out` belongs to the file being replaced, but SQLite
+    # finds a WAL by path: left in place it would shadow the new file for every
+    # reader and be checkpointed over its pages. Nothing holds it, because the
+    # caller holds the lock and the follower opens no connection until after.
+    for suffix in ("-wal", "-shm"):
+        Path(str(out) + suffix).unlink(missing_ok=True)
     os.replace(tmp, out)
     for suffix in ("-wal", "-shm"):
         Path(str(tmp) + suffix).unlink(missing_ok=True)
@@ -293,7 +382,7 @@ def plan_note(conn: sqlite3.Connection, doc_id: str, doc: dict | None) -> str:
     if not _is_file_doc(doc):
         # Not a note. Only an id that was once indexed as one has a row to drop.
         return "remove" if _has_row(conn, doc_id) else "skip"
-    if ext_of(doc.get("path", doc_id)) not in indexed_exts():
+    if ext_of(doc_path(doc)) not in indexed_exts():
         # Covers a rename to an excluded type as well as one never indexed.
         return "remove" if _has_row(conn, doc_id) else "skip"
     row = conn.execute(
@@ -321,7 +410,10 @@ def due_retries(
     for doc_id, first, last, missing in conn.execute(
         "SELECT n.id, r.first_failed_at, r.last_tried_at, r.missing FROM notes n"
         " LEFT JOIN retry r ON r.id = n.id WHERE n.status = 'failed'"
+        " ORDER BY r.last_tried_at IS NOT NULL, r.last_tried_at, n.id"
     ):
+        if len(due) >= RETRY_MAX_PER_CYCLE:
+            break
         if doc_id in exclude:
             continue
         if (
@@ -334,8 +426,15 @@ def due_retries(
     return due
 
 
-async def fetch_changes(client: ObsidianVaultClient, since: str) -> tuple[list[dict], str]:
-    """One longpoll `_changes` request. Returns (rows, last_seq)."""
+async def fetch_changes(
+    client: ObsidianVaultClient, since: str
+) -> tuple[list[dict], str, int]:
+    """One longpoll `_changes` request. Returns (rows, last_seq, pending).
+
+    `pending` is CouchDB's count of changes after this batch. It is what tells
+    a reader the index is behind, which the heartbeat cannot: a follower
+    catching up writes a fresh heartbeat on every batch.
+    """
     http = await client._get_client()
     resp = await http.get(
         "/_changes",
@@ -350,12 +449,19 @@ async def fetch_changes(client: ObsidianVaultClient, since: str) -> tuple[list[d
     )
     resp.raise_for_status()
     data = resp.json()
-    if not isinstance(data, dict) or not isinstance(data.get("results"), list) or "last_seq" not in data:
-        raise RuntimeError(f"_changes response has no results list or last_seq: {str(data)[:200]}")
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("results"), list)
+        or "last_seq" not in data
+        or not isinstance(data.get("pending"), int)
+    ):
+        raise RuntimeError(
+            f"_changes response has no results list, last_seq or pending: {str(data)[:200]}"
+        )
     for row in data["results"]:
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
             raise RuntimeError(f"_changes row without an id: {str(row)[:200]}")
-    return data["results"], str(data["last_seq"])
+    return data["results"], str(data["last_seq"]), data["pending"]
 
 
 async def fetch_current_docs(
@@ -394,6 +500,7 @@ def apply_cycle(
     chunks: dict[str, str],
     last_seq: str,
     now: int,
+    pending: int = 0,
 ) -> dict[str, int]:
     """Apply one cycle's plans and advance last_seq in ONE transaction.
 
@@ -414,7 +521,7 @@ def apply_cycle(
                 conn.execute("DELETE FROM retry WHERE id = ?", (doc_id,))
                 counts["put_ok"] += 1
             else:
-                missing = [c for c in doc.get("children", []) if c not in chunks]
+                missing = [c for c in (chunk_ids(doc) or []) if c not in chunks]
                 conn.execute(
                     "INSERT INTO retry(id, first_failed_at, last_tried_at, missing)"
                     " VALUES(?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET"
@@ -426,6 +533,7 @@ def apply_cycle(
         set_meta(
             conn,
             last_seq=last_seq,
+            pending=pending,
             heartbeat_at=now,
             note_count=by_status.get("ok", 0),
             failed_count=by_status.get("failed", 0),
@@ -440,7 +548,7 @@ async def sync_once(client: ObsidianVaultClient, conn: sqlite3.Connection, *, cl
     anywhere in the cycle leaves the index and last_seq exactly as they were.
     """
     since = get_meta(conn)["last_seq"]
-    rows, last_seq = await fetch_changes(client, since)
+    rows, last_seq, pending = await fetch_changes(client, since)
     now = int(clock())
 
     latest: dict[str, dict] = {}
@@ -464,14 +572,19 @@ async def sync_once(client: ObsidianVaultClient, conn: sqlite3.Connection, *, cl
         current = await fetch_current_docs(client, retry_ids)
         plans += [(d, plan_note(conn, d, current[d]), current[d]) for d in retry_ids]
 
-    wanted = [c for _, action, doc in plans if action == "put" for c in doc["children"]]
+    wanted = [c for _, action, doc in plans if action == "put" for c in (chunk_ids(doc) or [])]
     chunks = await client._fetch_chunks_batched(list(dict.fromkeys(wanted))) if wanted else {}
-    counts = apply_cycle(conn, plans, chunks, last_seq, now)
-    return {**counts, "retried": len(retry_ids), "changes": len(rows), "last_seq": last_seq}
+    counts = apply_cycle(conn, plans, chunks, last_seq, now, pending)
+    return {**counts, "retried": len(retry_ids), "changes": len(rows), "last_seq": last_seq,
+            "pending": pending}
 
 
-def index_is_current(path: Path, db_name: str) -> bool:
-    """True if `path` is an index of this schema version for this database."""
+def index_is_current(path: Path, db_name: str, origin: str | None = None) -> bool:
+    """True if `path` is an index of this schema, database, server and type list.
+
+    A changed OBSIDIAN_SEARCH_INDEX_EXTS rebuilds: otherwise the new list would
+    take effect only as notes happened to change.
+    """
     if not path.exists():
         return False
     try:
@@ -485,13 +598,15 @@ def index_is_current(path: Path, db_name: str) -> bool:
     return (
         meta.get("schema_version") == SCHEMA_VERSION
         and meta.get("db_name") == db_name
+        and (origin is None or meta.get("couch_origin") == origin)
+        and meta.get("exts") == ",".join(sorted(indexed_exts()))
         and "last_seq" in meta
     )
 
 
 async def open_index(client: ObsidianVaultClient, path: Path) -> sqlite3.Connection:
     """Open the index for following, building it first only if it is unusable."""
-    if index_is_current(path, client.config.db_name):
+    if index_is_current(path, client.config.db_name, couch_origin(client.config.couch_url)):
         conn = connect(path)
         create_schema(conn)  # adds the retry table to an index built before it existed
         _log(f"follow: resumed {path} from seq {get_meta(conn)['last_seq'][:16]}")
@@ -529,9 +644,15 @@ async def follow(
     retried with exponential backoff; the cycle that hit it wrote nothing, so
     no note is ever marked deleted or failed because CouchDB was unreachable.
     Any other exception propagates: systemd restarts the process, and the
-    restart resumes from the last committed sequence.
+    restart resumes from the last committed sequence. Holds `index_lock` for
+    its whole run.
     """
     stop = stop_event or asyncio.Event()
+    with index_lock(path):
+        await _follow_locked(client, path, stop)
+
+
+async def _follow_locked(client: ObsidianVaultClient, path: Path, stop: asyncio.Event) -> None:
     conn: sqlite3.Connection | None = None
     backoff = 1.0
     try:
@@ -596,7 +717,8 @@ def main(argv: list[str] | None = None) -> None:
     async def run() -> dict:
         client = ObsidianVaultClient(config)
         try:
-            return await build(client, out)
+            with index_lock(out):
+                return await build(client, out)
         finally:
             await client.close()
 
